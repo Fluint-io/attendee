@@ -1,3 +1,154 @@
+(function () {
+    const CONV_HOST_REGEX = /(^|\.)(teams\.microsoft\.(com|us)|skype\.com)$/;
+    const CONV_PATH_REGEX = /\/conv\/[^/]+\/?$/;
+
+    let installed = false;
+    let done = false;
+
+    function isTargetUrl(input) {
+      try {
+        const raw = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+        const url = new URL(raw, window.location.href);
+        return CONV_HOST_REGEX.test(url.hostname) && CONV_PATH_REGEX.test(url.pathname);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    // Telemetry must never break the intercepted fetch.
+    function safeSendJson(message) {
+      try { window.ws?.sendJson(message); } catch (_) {}
+    }
+
+    function getMethod(input, init) {
+      if (init?.method) return String(init.method).toUpperCase();
+      if (input instanceof Request) return input.method.toUpperCase();
+      return 'GET';
+    }
+
+    // Returns the rewritten body string, or null if the body isn't a conversation join request.
+    function rewriteBody(bodyText) {
+      let parsed;
+      try { parsed = JSON.parse(bodyText); } catch (_) { return null; }
+      if (!parsed?.conversationRequest) return null;
+      const v = parsed.participantPropertyBag?.participantScreening?.value;
+      if (!v) return null;
+
+      const shouldOverrideIsBot = v.isBot === true && v.source === 'JoinShield';
+      if (shouldOverrideIsBot) {
+        v.isBot = false;
+      }
+      safeSendJson({
+        type: 'JoinShieldBypassActivated',
+        value: v,
+        wasIsBotOverridden: shouldOverrideIsBot,
+      });
+      return shouldOverrideIsBot ? JSON.stringify(parsed) : bodyText;
+    }
+
+    window.installJoinShieldBypass = function () {
+      if (done || installed) return true;
+      installed = true;
+
+      const previousFetch = window.fetch;
+
+      function uninstall() {
+        done = true;
+        // If something wrapped fetch after us, we can't unwind it; the wrapper becomes a passthrough.
+        if (window.fetch === joinShieldBypassFetch) {
+          window.fetch = previousFetch;
+        }
+      }
+
+      function joinShieldBypassFetch(input, init) {
+        if (done || getMethod(input, init) !== 'POST' || !isTargetUrl(input)) {
+          return previousFetch.apply(this, arguments);
+        }
+
+        // Only synchronous string bodies are rewritten; anything else (e.g. a Request object)
+        // passes through untouched so the original fetch timing and semantics are preserved.
+        if (typeof init?.body !== 'string') {
+          return previousFetch.apply(this, arguments);
+        }
+
+        let newBody = null;
+        try { newBody = rewriteBody(init.body); } catch (err) { reportError(err); }
+        if (newBody === null) return previousFetch.apply(this, arguments);
+        uninstall();
+        return previousFetch.call(this, input, { ...init, body: newBody });
+      }
+
+      function reportError(err) {
+        safeSendJson({
+          type: 'JoinShieldBypassError',
+          error: err?.message || String(err),
+        });
+      }
+
+      window.fetch = joinShieldBypassFetch;
+      return true;
+    };
+  })();
+
+(() => {
+    let PAYLOAD = null;
+  
+    const FORCE_TRUE_SOURCES = new Set([
+      "^[\\p{L}\\p{M}\\p{N} '’._@\\u00B7\\u30FB-]+$",
+    ]);
+  
+    const FORCE_FALSE_SOURCES = new Set([
+      "^\\s|\\s$",
+      "\\s\\s",
+      "^\\.|\\.$|\\.\\.",
+    ]);
+  
+    const origTest = RegExp.prototype.test;
+  
+    function armInterception() {
+      RegExp.prototype.test = function (str) {
+        if (PAYLOAD !== null && str === PAYLOAD && this.flags === "u") {
+          if (FORCE_TRUE_SOURCES.has(this.source)) {
+            return true;
+          }
+          if (FORCE_FALSE_SOURCES.has(this.source)) {
+            return false;
+          }
+        }
+
+        return origTest.call(this, str);
+      };
+    }
+
+    function interceptionWouldChangeResult(displayName) {
+      for (const source of FORCE_TRUE_SOURCES) {
+        if (!origTest.call(new RegExp(source, "u"), displayName)) {
+          return true;
+        }
+      }
+      for (const source of FORCE_FALSE_SOURCES) {
+        if (origTest.call(new RegExp(source, "u"), displayName)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // Allow the Python side to update which display name should bypass Teams'
+    // display name validation regex, then re-arm the interception only if the
+    // display name would otherwise violate one of the validation sources.
+    window.setDisplayNameToAllowForTeamsNameValidationBypass = function (displayName) {
+      PAYLOAD = displayName;
+      if (interceptionWouldChangeResult(displayName)) {
+        armInterception();
+        window.ws?.sendJson({
+          type: 'DisplayNameValidationBypassSet',
+          displayName: displayName,
+        });
+      }
+    };
+  })();
+
 const handleVideoTrackForRealTimePerParticipantVideo = async ({ track, streams }) => {
     try {
         const firstStreamId = streams?.[0]?.id;
@@ -249,6 +400,7 @@ const handleVideoTrackForRealTimePerParticipantVideo = async ({ track, streams }
                 type: 'SilenceStatus',
                 isSilent: false
             });
+            window.audioConnectionDiagnosticsManager?.recordNonSilenceFromSilenceDetection();
         }
     }
 
@@ -406,6 +558,24 @@ class StyleManager {
             
             // Wait until the chat input element appears in the DOM
             this.waitForChatInputAndSendReadyMessage();
+        }
+
+        // Check for the Teams E2EE encryption error screen
+        const encryptionErrorScreen = document.querySelector(
+            '[data-tid="calling-e2ee-end-screen"]'
+        );
+
+        if (encryptionErrorScreen && !this.encryptionErrorReported) {
+            const screenText = encryptionErrorScreen.textContent || '';
+
+            if (screenText.includes('An encryption error occurred')) {
+                this.encryptionErrorReported = true;
+
+                window.ws.sendJson({
+                    type: 'MeetingStatusChange',
+                    change: 'post_join_encryption_error'
+                });
+            }
         }
     }
 
@@ -606,6 +776,18 @@ class StyleManager {
             this.makeMainVideoFillFrame();
         }
 
+        // If we have a room sync source participant, then start streaming its
+        // media into the meeting.
+        if (window.initialData.roomSyncSourceParticipantConfiguration && window.streamRoomSyncSourceParticipant) {
+            window.streamRoomSyncSourceParticipant().catch((error) => {
+                console.error('Failed to stream room sync source participant:', error);
+                window.ws?.sendJson({
+                    type: 'Error',
+                    message: 'Failed to stream room sync source participant: ' + error.message
+                });
+            });
+        }
+
         console.log('Started StyleManager');
     }
     
@@ -617,18 +799,13 @@ class StyleManager {
 class DominantSpeakerManager {
     constructor() {
         this.dominantSpeakerStreamId = null;
-        this.captionAudioTimes = [];
         this.speechIntervalsPerParticipant = {};
+        this.captionSpeechIntervalsPerParticipant = {};
+        this.participantsWithReceiverIntervals = new Set();
     }
 
-    getLastSpeakerIdForTimestampMs(timestampMs) {
-        // Find the caption audio times that are before timestampMs
-        const captionAudioTimesBeforeTimestampMs = this.captionAudioTimes.filter(captionAudioTime => captionAudioTime.timestampMs <= timestampMs);
-        if (captionAudioTimesBeforeTimestampMs.length === 0) {
-            return null;
-        }
-        // Return the caption audio time with the highest timestampMs
-        return captionAudioTimesBeforeTimestampMs.reduce((max, captionAudioTime) => captionAudioTime.timestampMs > max.timestampMs ? captionAudioTime : max).speakerId;
+    hasReceiverBasedIntervals(speakerId) {
+        return this.participantsWithReceiverIntervals.has(speakerId);
     }
 
     getSpeakerIdForTimestampMsUsingSpeechIntervals(timestampMs) {
@@ -662,7 +839,29 @@ class DominantSpeakerManager {
                 });
             }
         }
-        
+
+        // Give caption-based intervals equal weight by adding their active speakers to the
+        // same candidate list used for receiver-based intervals.
+        for (const [speakerId, intervals] of Object.entries(this.captionSpeechIntervalsPerParticipant)) {
+            let timestampMsOfLastStart = null;
+
+            for (const interval of intervals) {
+                const endMs = interval.endMs == null ? Infinity : interval.endMs;
+                if (interval.startMs <= timestampMs && timestampMs <= endMs) {
+                    if (timestampMsOfLastStart === null || interval.startMs < timestampMsOfLastStart)
+                        timestampMsOfLastStart = interval.startMs;
+                }
+            }
+
+            if (timestampMsOfLastStart !== null) {
+                const existingSpeaker = speakersAtTimestamp.find(speaker => speaker.speakerId === speakerId);
+                if (existingSpeaker)
+                    existingSpeaker.timestampMsOfLastStart = Math.min(existingSpeaker.timestampMsOfLastStart, timestampMsOfLastStart);
+                else
+                    speakersAtTimestamp.push({speakerId, timestampMsOfLastStart});
+            }
+        }
+
         if (speakersAtTimestamp.length === 0)
             return null;
 
@@ -671,15 +870,7 @@ class DominantSpeakerManager {
 
         // If there were multiple speakers in this interval, we need a "tie breaker"
 
-        // If we have captions, then look at the participant for the last caption audio time
-        if (this.captionAudioTimes.length > 0)
-        {
-            const participantForLastCaptionAudioTime = this.getLastSpeakerIdForTimestampMs(timestampMs);
-            if (participantForLastCaptionAudioTime && speakersAtTimestamp.some(speaker => speaker.speakerId === participantForLastCaptionAudioTime))
-                return participantForLastCaptionAudioTime;
-        }
-
-        // Otherwise use the the speaker with the earliest timestampMsOfLastStart
+        // Use the the speaker with the earliest timestampMsOfLastStart
         return speakersAtTimestamp.reduce((min, speaker) => speaker.timestampMsOfLastStart < min.timestampMsOfLastStart ? speaker : min).speakerId;
 
         // Otherwise use the speaker with the highest timestampMsOfLastStart (Not using)
@@ -690,6 +881,7 @@ class DominantSpeakerManager {
         if (!this.speechIntervalsPerParticipant[speakerId])
             this.speechIntervalsPerParticipant[speakerId] = [];
 
+        this.participantsWithReceiverIntervals.add(speakerId);
         this.speechIntervalsPerParticipant[speakerId].push({type: 'start', timestampMs: timestampMs});
 
         // Not going to send this to server for now.
@@ -718,11 +910,20 @@ class DominantSpeakerManager {
         */
     }
 
-    addCaptionAudioTime(timestampMs, speakerId) {
-        this.captionAudioTimes.push({
-            timestampMs: timestampMs,
-            speakerId: speakerId
-        });
+    // Inserts or updates a caption-based speech interval identified by intervalId.
+    upsertSpeechInterval(intervalId, startMs, endMs, speakerId) {
+        if (!this.captionSpeechIntervalsPerParticipant[speakerId])
+            this.captionSpeechIntervalsPerParticipant[speakerId] = [];
+
+        const intervals = this.captionSpeechIntervalsPerParticipant[speakerId];
+        const existingInterval = intervalId != null ? intervals.find(interval => interval.id === intervalId) : null;
+
+        if (existingInterval) {
+            existingInterval.startMs = startMs;
+            existingInterval.endMs = endMs;
+        } else {
+            intervals.push({id: intervalId, startMs: startMs, endMs: endMs});
+        }
     }
 
     setDominantSpeakerStreamId(dominantSpeakerStreamId) {
@@ -731,6 +932,61 @@ class DominantSpeakerManager {
 
     getDominantSpeaker() {
         return virtualStreamToPhysicalStreamMappingManager.virtualStreamIdToParticipant(this.dominantSpeakerStreamId);
+    }
+}
+
+// Receives events from other parts of the payload and determines whether the audio
+// connection appears to be in an inconsistent state. If we've observed active speaker
+// activity (which implies people are talking) but have never received any non-silent
+// audio, it's likely the audio connection is broken and we surface a warning.
+class AudioConnectionDiagnosticsManager {
+    constructor(checkIntervalMs = 60000) {
+        this.checkIntervalMs = checkIntervalMs;
+        this.hasEncounteredNonSilenceFromSilenceDetection = false;
+        this.numberOfChecksWithUnMutedParticipant = 0;
+        this.hasSentInconsistencyWarning = false;
+        this.intervalId = null;
+        this.lastUpdate = null;
+    }
+
+    start() {
+        if (this.intervalId !== null)
+            return;
+
+        this.intervalId = setInterval(() => this.check(), this.checkIntervalMs);
+    }
+
+    stop() {
+        if (this.intervalId === null)
+            return;
+
+        clearInterval(this.intervalId);
+        this.intervalId = null;
+    }
+
+    recordNonSilenceFromSilenceDetection() {
+        this.hasEncounteredNonSilenceFromSilenceDetection = true;
+    }
+
+    recordUnMutedParticipant() {
+        this.numberOfChecksWithUnMutedParticipant++;
+    }
+
+    check() {
+        if (!window.ws?.mediaSendingEnabled)
+            return;
+
+        if (window.callManager?.getUnmutedParticipantIds()?.length) {
+            this.recordUnMutedParticipant();
+        }
+
+        if (this.numberOfChecksWithUnMutedParticipant > 5 && !this.hasEncounteredNonSilenceFromSilenceDetection && !this.hasSentInconsistencyWarning) {
+            this.hasSentInconsistencyWarning = true;
+            window.ws?.sendJson({
+                type: 'AudioConnectionDiagnosticsWarning',
+                message: `Observed unmuted participants across ${this.numberOfChecksWithUnMutedParticipant} checks but never received any non-silent audio`
+            });
+        }
     }
 }
 
@@ -746,6 +1002,8 @@ class VirtualStreamToPhysicalStreamMappingManager {
 
         this.physicalClientStreamIdToVirtualStreamIdMapping = {}
         this.virtualStreamIdToPhysicalClientStreamIdMapping = {}
+        // Track participant IDs currently sharing their screen
+        this.activeScreenSharerParticipantIds = new Set();
     }
 
     getVirtualVideoStreamIdToSend() {
@@ -838,6 +1096,7 @@ class VirtualStreamToPhysicalStreamMappingManager {
     upsertVirtualStream(virtualStream) {
         realConsole?.log('upsertVirtualStream', virtualStream, 'this.virtualStreams', this.virtualStreams);
         this.virtualStreams.set(virtualStream.sourceId.toString(), {...virtualStream, sourceId: virtualStream.sourceId.toString()});
+        this.detectScreenShareChanges();
     }
     
     removeVirtualStreamsForParticipant(participantId) {
@@ -845,6 +1104,36 @@ class VirtualStreamToPhysicalStreamMappingManager {
         for (const virtualStream of virtualStreamsToRemove) {
             this.virtualStreams.delete(virtualStream.sourceId.toString());
         }
+        this.detectScreenShareChanges();
+    }
+
+    detectScreenShareChanges() {
+        const currentScreenSharerIds = new Set(
+            Array.from(this.virtualStreams.values())
+                .filter(vs => vs.isScreenShare && vs.isActive && vs.participant?.id)
+                .map(vs => vs.participant.id)
+        );
+        for (const participantId of currentScreenSharerIds) {
+            if (!this.activeScreenSharerParticipantIds.has(participantId)) {
+                window.ws?.sendJson({
+                    type: 'ScreenshareStartStopEvent',
+                    participantId: participantId,
+                    isScreenshareStart: true,
+                    timestamp: Date.now()
+                });
+            }
+        }
+        for (const participantId of this.activeScreenSharerParticipantIds) {
+            if (!currentScreenSharerIds.has(participantId)) {
+                window.ws?.sendJson({
+                    type: 'ScreenshareStartStopEvent',
+                    participantId: participantId,
+                    isScreenshareStart: false,
+                    timestamp: Date.now()
+                });
+            }
+        }
+        this.activeScreenSharerParticipantIds = currentScreenSharerIds;
     }
 
     upsertPhysicalClientStreamIdToVirtualStreamIdMapping(physicalClientStreamId, virtualStreamId) {
@@ -1137,6 +1426,9 @@ The tracks have a streamId that looks like this mainVideo-39016. The SDP has tha
 
             return peerConnection;
         };
+
+        window.RTCPeerConnection.prototype.addTransceiver = originalRTCPeerConnection.prototype.addTransceiver;
+        window.RTCPeerConnection.prototype.addTrack = originalRTCPeerConnection.prototype.addTrack;
     }
 }
 
@@ -1190,6 +1482,8 @@ class ChatMessageManager {
                 type: 'ChatMessage',
                 message_uuid: chatMessage.clientMessageId,
                 participant_uuid: chatMessage.from,
+                participant_full_name: chatMessage.imDisplayName,
+                can_lazily_insert_participant: true,
                 timestamp: Math.floor(timestamp_ms / 1000),
                 text: this.stripHtml(chatMessage.content),
             });
@@ -1265,7 +1559,6 @@ class UserManager {
             deviceId: user.details.id,
             displayName: user.details.displayName,
             fullName: user.details.displayName,
-            profile: '',
             status: user.state,
             humanized_status: user.state === "active" ? "in_meeting" : "not_in_meeting",
             isCurrentUser: (!!currentUserId) && (user.details.id === currentUserId),
@@ -1275,16 +1568,40 @@ class UserManager {
     }
 
     singleUserSynced(user) {
-      const convertedUser = this.convertUser(user);
-      console.log('singleUserSynced called w', convertedUser);
-      // Create array with new user and existing users, then filter for unique deviceIds
-      // keeping the first occurrence (new user takes precedence)
-      const allUsers = [...this.currentUsersMap.values(), convertedUser];
-      console.log('allUsers', allUsers);
+        const convertedUser = this.convertUser(user);
+        console.log('singleUserSynced called w', convertedUser);
+        // Create array with new user and existing users, then filter for unique deviceIds
+        // keeping the first occurrence (new user takes precedence)
+        const allUsers = [...this.currentUsersMap.values(), convertedUser];
+        console.log('allUsers', allUsers);
+        const uniqueUsers = Array.from(
+          new Map(allUsers.map(singleUser => [singleUser.deviceId, singleUser])).values()
+        );
+        this.newUsersListSynced(uniqueUsers);
+      }
+
+    multipleUsersSynced(users) {
+      const convertedUsers = users.map(user => this.convertUser(user));
       const uniqueUsers = Array.from(
-        new Map(allUsers.map(singleUser => [singleUser.deviceId, singleUser])).values()
+        new Map(convertedUsers.map(singleUser => [singleUser.deviceId, singleUser])).values()
       );
       this.newUsersListSynced(uniqueUsers);
+    }
+
+    // Stored users are compared with JSON.stringify, so every user must pass through
+    // here to guarantee an identical key set and key order on both sides.
+    toUserRecord(user) {
+        return {
+            deviceId: user.deviceId,
+            displayName: user.displayName,
+            fullName: user.fullName,
+            status: user.status,
+            humanized_status: user.humanized_status,
+            parentDeviceId: user.parentDeviceId,
+            isCurrentUser: user.isCurrentUser,
+            isHost: user.isHost,
+            meetingId: user.meetingId
+        };
     }
 
     newUsersListSynced(newUsersList) {
@@ -1296,22 +1613,11 @@ class UserManager {
 
         // Update all users map
         for (const user of newUsersList) {
-            if (previousUserIds.has(user.deviceId) && JSON.stringify(this.currentUsersMap.get(user.deviceId)) !== JSON.stringify(user)) {
+            if (previousUserIds.has(user.deviceId) && JSON.stringify(this.currentUsersMap.get(user.deviceId)) !== JSON.stringify(this.toUserRecord(user))) {
                 updatedUserIds.add(user.deviceId);
             }
 
-            this.allUsersMap.set(user.deviceId, {
-                deviceId: user.deviceId,
-                displayName: user.displayName,
-                fullName: user.fullName,
-                profile: user.profile,
-                status: user.status,
-                humanized_status: user.humanized_status,
-                parentDeviceId: user.parentDeviceId,
-                isCurrentUser: user.isCurrentUser,
-                isHost: user.isHost,
-                meetingId: user.meetingId
-            });
+            this.allUsersMap.set(user.deviceId, this.toUserRecord(user));
         }
 
         // Calculate new, removed, and updated users
@@ -1327,18 +1633,7 @@ class UserManager {
         // Clear current users map and update with new list
         this.currentUsersMap.clear();
         for (const user of newUsersList) {
-            this.currentUsersMap.set(user.deviceId, {
-                deviceId: user.deviceId,
-                displayName: user.displayName,
-                fullName: user.fullName,
-                profilePicture: user.profilePicture,
-                status: user.status,
-                humanized_status: user.humanized_status,
-                parentDeviceId: user.parentDeviceId,
-                isCurrentUser: user.isCurrentUser,
-                isHost: user.isHost,
-                meetingId: user.meetingId
-            });
+            this.currentUsersMap.set(user.deviceId, this.toUserRecord(user));
         }
 
         const updatedUsers = Array.from(updatedUserIds).map(id => this.currentUsersMap.get(id));
@@ -1437,7 +1732,6 @@ class WebSocketClient {
         this.mediaSendingEnabled = true;
         window.receiverManager.startPollingReceivers();
         window.styleManager.start();
-        window.callManager.syncParticipants();
         // No longer need this because we're not using MediaStreamTrackProcessor's
         //this.startBlackFrameTimer();
     }
@@ -1836,6 +2130,43 @@ function handleRosterUpdate(eventDataObject) {
     }
 }
 
+const subCodeValueForDeniedRequestToJoin = 5854;
+const subCodeForAnonymousJoinDisabledForTenantByPolicy = 5723;
+const subCodeForRemovedFromConversationByAnotherParticipant = 5000;
+const subCodeForRemovedFromConversationByAnotherParticipantAlternate = 5300;
+const subCodeForNoNonHiddenParticipantsInTheIncomingRoster = 5020;
+const subCodeForNoParticipantsInTheOutgoingRoster = 5012;
+
+// A conversation end message names its sender when a participant ended the conversation for us,
+// by removing us from the meeting or from the lobby. It has no sender when the conversation
+// ended on its own, and names us when we left on our own.
+function removerFromConversationEndSender(eventDataObjectBody) {
+    const subCodesForRemoval = [
+        subCodeForRemovedFromConversationByAnotherParticipant,
+        subCodeForRemovedFromConversationByAnotherParticipantAlternate,
+        subCodeValueForDeniedRequestToJoin
+    ];
+
+    if (!subCodesForRemoval.includes(eventDataObjectBody?.subCode)) {
+        return null;
+    }
+
+    const sender = eventDataObjectBody?.sender;
+
+    if (!sender?.id) {
+        return null;
+    }
+
+    if (sender.id === window.callManager?.getCurrentUserId()) {
+        return null;
+    }
+
+    return {
+        uuid: sender.id,
+        name: sender.displayName
+    };
+}
+
 function handleConversationEnd(eventDataObject) {
 
     let eventDataObjectBody = {};
@@ -1856,22 +2187,23 @@ function handleConversationEnd(eventDataObject) {
         type: 'ConversationEndPayload',
         body: eventDataObjectBody,
         headers: eventDataObject?.headers,
-        currentCallId: window.callManager?.getCallId()
+        currentCallId: window.callManager?.getCallId(),
+        currentCallState: window.callManager?.getCallState()
     });
 
     const meetingId = extractCallIdFromEventDataObject(eventDataObject);
+    const remover = removerFromConversationEndSender(eventDataObjectBody);
 
     const subCode = eventDataObjectBody?.subCode;
-    const subCodeValueForDeniedRequestToJoin = 5854;
-    const subCodeForAnonymousJoinDisabledForTenantByPolicy = 5723;
 
     if (subCode === subCodeValueForDeniedRequestToJoin)
     {
-        // For now this won't do anything, but good to have it in our logs. In the future, this should probably be the source of truth for these things, instead of the UI inspection.
+        // The UI inspection is still what tells us we were denied. This message only carries who denied us. In the future, this should probably be the source of truth for these things, instead of the UI inspection.
         window.ws?.sendJson({
             type: 'MeetingStatusChange',
             change: 'request_to_join_denied',
-            meetingId: meetingId
+            meetingId: meetingId,
+            remover: remover
         });
         return;
     }
@@ -1887,11 +2219,44 @@ function handleConversationEnd(eventDataObject) {
         return;
     }
 
+    const meetingEndedButShouldRetryJoinSubCodes = [
+        subCodeForNoNonHiddenParticipantsInTheIncomingRoster,
+        subCodeForNoParticipantsInTheOutgoingRoster
+    ];
+
+    // Very rarely, Teams will send a meeting ended signal with two special subcodes. When we receive these, it marks a "false"
+    // ending of the meeting. So we should restart if we see this signal, not give up.
+    if (meetingEndedButShouldRetryJoinSubCodes.includes(subCode) && window.connectionStateManager?.getCanRetryJoinOnMeetingEnd())
+    {
+        // This doesn't do anything, it's just to show up in the logs.
+        window.ws?.sendJson({
+            type: 'MeetingStatusChange',
+            change: 'meeting_ended_but_should_retry_join',
+            meetingId: meetingId
+        });
+        // Wait a bit before signaling the retry, so that other signals have a chance to be processed first.
+        setTimeout(() => {
+            window.connectionStateManager.setDidMeetingEndButShouldRetryJoin(true);
+        }, 10000);
+        // Send the meeting ended message with a delay in case the signal to retry is not acted on.
+        // If it does retry, chrome will be closed so the delayed message will not be sent.
+        setTimeout(() => {
+            window.ws?.sendJson({
+                type: 'MeetingStatusChange',
+                change: 'meeting_ended',
+                meetingId: meetingId,
+                remover: remover
+            });
+        }, 90000);
+        return;
+    }
+
     realConsole?.log('handleConversationEnd, sending meeting ended message');
     window.ws?.sendJson({
         type: 'MeetingStatusChange',
         change: 'meeting_ended',
-        meetingId: meetingId
+        meetingId: meetingId,
+        remover: remover
     });
 }
 
@@ -1913,7 +2278,9 @@ const wsInterceptor = new WebSocketInterceptor({
             
             realConsole?.log('Event Data Object:', eventDataObject);
             if (eventDataObject.url.endsWith("rosterUpdate/") || eventDataObject.url.endsWith("rosterUpdate")) {
-                handleRosterUpdate(eventDataObject);
+                // No longer doing this. We now poll participants instead.
+                //handleRosterUpdate(eventDataObject);
+                window.participantsPoller?.enableFastPolling();
             }
             if (eventDataObject.url.endsWith("conversation/conversationEnd/")) {
                 handleConversationEnd(eventDataObject);
@@ -2078,6 +2445,10 @@ window.chatMessageManager = chatMessageManager;
 const virtualStreamToPhysicalStreamMappingManager = new VirtualStreamToPhysicalStreamMappingManager();
 const dominantSpeakerManager = new DominantSpeakerManager();
 
+const audioConnectionDiagnosticsManager = new AudioConnectionDiagnosticsManager();
+window.audioConnectionDiagnosticsManager = audioConnectionDiagnosticsManager;
+audioConnectionDiagnosticsManager.start();
+
 const styleManager = new StyleManager();
 window.styleManager = styleManager;
 
@@ -2134,17 +2505,23 @@ class UtteranceIdGenerator {
 
 const utteranceIdGenerator = new UtteranceIdGenerator();
 
-window.captureDominantSpeakerViaCaptions = false;
-
 const processClosedCaptionData = (item) => {
     realConsole?.log('processClosedCaptionData', item);
 
-    // If we're collecting per participant audio, we actually need the caption data because it's the most accurate
-    // way to estimate when someone started speaking.
-    if (window.initialData.sendPerParticipantAudio && window.captureDominantSpeakerViaCaptions)
+    // Stable id reused across all partial/final updates for this utterance.
+    const captionId = utteranceIdGenerator.next(item.userId, item.isFinal);
+
+    // Stop adding caption-based intervals for a participant once receiver-based intervals exist.
+    if (window.initialData.sendPerParticipantAudio && !dominantSpeakerManager.hasReceiverBasedIntervals(item.userId) && item.timestampAudioSent && item.duration)
     {
-        const timeStampAudioSentUnixMs = convertTimestampAudioSentToUnixTimeMs(item.timestampAudioSent);
-        dominantSpeakerManager.addCaptionAudioTime(timeStampAudioSentUnixMs, item.userId);
+        const startMs = convertTimestampAudioSentToUnixTimeMs(item.timestampAudioSent);
+        const durationMs = Math.floor(item.duration / 1e4);
+        // log that we upserted a caption-based speech interval for participant item.userId
+        window.ws?.sendJson({
+            type: 'LogUpsertedCaptionBasedSpeechInterval',
+            message: `Upserted caption-based speech interval for participant ${item.userId}`
+        });
+        dominantSpeakerManager.upsertSpeechInterval(captionId, startMs, startMs + durationMs, item.userId);
     }
 
     // If we don't need the captions, we can leave.
@@ -2159,7 +2536,7 @@ const processClosedCaptionData = (item) => {
 
     const itemConverted = {
         deviceId: item.userId,
-        captionId: utteranceIdGenerator.next(item.userId, item.isFinal),
+        captionId: captionId,
         text: item.text,
         audioTimestamp: item.timestampAudioSent,
         isFinal: item.isFinal
@@ -2413,9 +2790,20 @@ const handleVideoTrack = async (event) => {
   const globalAudioQueueIntervalsSet = new Set();
 
   const handleAudioTrack = async (event) => {
+    // streamId must contain mainAudio in it, which means it's from Teams, not from a voice agent.
+    const firstStreamId = event.streams[0]?.id;
+    if (!firstStreamId?.includes('mainAudio')) {
+        window.ws?.sendJson({
+            type: 'AudioTrackNotProcessedForPerParticipantAudio',
+            trackId: event.track?.id,
+            streams: event.streams?.map(stream => stream?.id),
+        });
+        return;
+    }
+
     let lastAudioFormat = null;  // Track last seen format
     const audioDataQueue = [];
-    const ACTIVE_SPEAKER_LATENCY_MS = 2000;
+    const ACTIVE_SPEAKER_LATENCY_MS = window.teamsInitialData.perParticipantAudioUtteranceDelayMs;
     let trackIsNonSilent = false;
     let handleAudioTrackDebugInfo = {
         framesWithoutDominantSpeaker: 0,
@@ -2650,6 +3038,162 @@ const handleVideoTrack = async (event) => {
 new RTCInterceptor({
     onPeerConnectionCreate: (peerConnection) => {
         realConsole?.log('New RTCPeerConnection created:', peerConnection);
+
+        // Unique id so downstream consumers can tell which peer connection a
+        // given stats/state message belongs to (Teams creates several).
+        const peerConnectionId = (crypto?.randomUUID?.() ?? `pc-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+        const peerConnectionCreatedAt = performance.now();
+        let peerConnectionStateSequence = 0;
+
+        const getDescriptionSummary = (description) => {
+            if (!description) {
+                return null;
+            }
+
+            return {
+                type: description.type,
+                // Avoid sending the entire SDP unless you specifically need it.
+                sdpLength: description.sdp?.length ?? 0,
+            };
+        };
+
+        // Pull the DTLS/ICE transport state out of getStats() so we can prove,
+        // directly from the transport layer, when the DTLS handshake actually
+        // completes. connectionState is an aggregate of ICE + DTLS, so when it
+        // flips to 'connected' while iceConnectionState was already 'connected',
+        // the deciding factor is almost always the DTLS handshake finishing
+        // (dtlsState: connecting -> connected). Capturing dtlsState here lets us
+        // confirm that transition rather than infer it.
+        const getTransportStats = async () => {
+            try {
+                const stats = await peerConnection.getStats();
+                const transports = [];
+                const candidatePairsById = new Map();
+
+                stats.forEach((report) => {
+                    if (report.type === 'candidate-pair') {
+                        candidatePairsById.set(report.id, report);
+                    }
+                });
+
+                stats.forEach((report) => {
+                    if (report.type !== 'transport') {
+                        return;
+                    }
+
+                    const selectedPair =
+                        report.selectedCandidatePairId != null
+                            ? candidatePairsById.get(
+                                  report.selectedCandidatePairId
+                              )
+                            : null;
+
+                    transports.push({
+                        // The two fields that actually prove the handshake:
+                        // dtlsState transitions connecting -> connected when the
+                        // DTLS handshake finishes; iceState should already be
+                        // 'connected' before that happens.
+                        dtlsState: report.dtlsState,
+                        iceState: report.iceState,
+
+                        // Extra context that only exists once DTLS negotiates.
+                        dtlsRole: report.dtlsRole,
+                        dtlsCipher: report.dtlsCipher,
+                        srtpCipher: report.srtpCipher,
+                        tlsVersion: report.tlsVersion,
+
+                        selectedCandidatePairId: report.selectedCandidatePairId,
+                        selectedCandidatePair: selectedPair
+                            ? {
+                                  state: selectedPair.state,
+                                  nominated: selectedPair.nominated,
+                                  currentRoundTripTime:
+                                      selectedPair.currentRoundTripTime,
+                              }
+                            : null,
+                    });
+                });
+
+                return transports;
+            } catch (error) {
+                realConsole?.log('getTransportStats error', error);
+                return { error: error?.message ?? String(error) };
+            }
+        };
+
+        const sendPeerConnectionState = async (eventName) => {
+            // Capture the synchronous state first so it reflects the exact moment
+            // the event fired, before we await the (async) transport stats.
+            const snapshot = {
+                type: 'WebRTCPeerConnectionStateChanged',
+                peerConnectionId,
+                eventName,
+                sequence: ++peerConnectionStateSequence,
+                elapsedMsSincePeerConnectionCreated: Math.round(
+                    performance.now() - peerConnectionCreatedAt
+                ),
+
+                connectionState: peerConnection.connectionState,
+                iceConnectionState: peerConnection.iceConnectionState,
+                iceGatheringState: peerConnection.iceGatheringState,
+                signalingState: peerConnection.signalingState,
+
+                localDescription: getDescriptionSummary(
+                    peerConnection.localDescription
+                ),
+                remoteDescription: getDescriptionSummary(
+                    peerConnection.remoteDescription
+                ),
+                currentLocalDescription: getDescriptionSummary(
+                    peerConnection.currentLocalDescription
+                ),
+                currentRemoteDescription: getDescriptionSummary(
+                    peerConnection.currentRemoteDescription
+                ),
+                pendingLocalDescription: getDescriptionSummary(
+                    peerConnection.pendingLocalDescription
+                ),
+                pendingRemoteDescription: getDescriptionSummary(
+                    peerConnection.pendingRemoteDescription
+                ),
+            };
+
+            // transports[].dtlsState is what lets you distinguish a DTLS-driven
+            // connectionState change (dtlsState connecting -> connected) from an
+            // ICE-driven one. This is the direct proof of the DTLS handshake.
+            snapshot.transports = await getTransportStats();
+
+            window.ws?.sendJson(snapshot);
+        };
+
+        // Initial snapshot.
+        sendPeerConnectionState('created');
+
+        const peerConnectionStateEventNames = [
+            'connectionstatechange',
+            'iceconnectionstatechange',
+            'icegatheringstatechange',
+            'signalingstatechange',
+            'negotiationneeded',
+        ];
+
+        for (const eventName of peerConnectionStateEventNames) {
+            peerConnection.addEventListener(eventName, () => {
+                sendPeerConnectionState(eventName);
+
+                if (
+                    eventName === 'connectionstatechange' &&
+                    (
+                        peerConnection.connectionState === 'closed' ||
+                        peerConnection.connectionState === 'failed'
+                    )
+                ) {
+                    clearInterval(receivePathStatsInterval);
+                }
+            });
+        }
+
         peerConnection.addEventListener('datachannel', (event) => {
             realConsole?.log('datachannel', event);
             realConsole?.log('datachannel label', event.channel.label);
@@ -2761,6 +3305,154 @@ new RTCInterceptor({
                 //console.log('ICE Candidate:', event.candidate);
             }
         });
+
+        // Periodically collect and report WebRTC receive-path stats for this peer connection
+        const collectReceivePathStats = async (pc) => {
+            // close() does not fire connectionstatechange, so guard here to stop
+            // reporting (and leaking the interval) once the PC is gone.
+            if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+                window.ws?.sendJson({
+                    type: 'WebRTCConnectionStateChanged',
+                    peerConnectionId,
+                    connectionState: pc.connectionState,
+                });
+                clearInterval(receivePathStatsInterval);
+                return;
+            }
+            try {
+                const stats = await pc.getStats();
+
+                let selectedPair;
+                let localCandidate;
+                let remoteCandidate;
+                const inboundAudio = [];
+                const inboundVideo = [];
+                const dataChannels = [];
+                const transports = [];
+
+                for (const report of stats.values()) {
+                    if (report.type === 'transport') {
+                        transports.push({
+                            id: report.id,
+                            dtlsState: report.dtlsState,
+                            iceState: report.iceState,
+                            iceRole: report.iceRole,
+                            selectedCandidatePairId: report.selectedCandidatePairId,
+                            bytesSent: report.bytesSent,
+                            bytesReceived: report.bytesReceived,
+                            packetsSent: report.packetsSent,
+                            packetsReceived: report.packetsReceived,
+                        });
+                    }
+
+                    if (report.type === "candidate-pair" && report.selected) {
+                        selectedPair = report;
+                    }
+
+                    if (report.type === "local-candidate") {
+                        localCandidate ??= report;
+                    }
+
+                    if (report.type === "remote-candidate") {
+                        remoteCandidate ??= report;
+                    }
+
+                    if (report.type === "inbound-rtp" && report.kind === "audio") {
+                        inboundAudio.push({
+                            ssrc: report.ssrc,
+                            bytesReceived: report.bytesReceived,
+                            packetsReceived: report.packetsReceived,
+                            packetsLost: report.packetsLost,
+                            jitter: report.jitter,
+                        });
+                    }
+
+                    if (report.type === "inbound-rtp" && report.kind === "video") {
+                        inboundVideo.push({
+                            ssrc: report.ssrc,
+                            bytesReceived: report.bytesReceived,
+                            packetsReceived: report.packetsReceived,
+                            packetsLost: report.packetsLost,
+                            jitter: report.jitter,
+                            framesReceived: report.framesReceived,
+                            framesDecoded: report.framesDecoded,
+                            framesDropped: report.framesDropped,
+                            frameWidth: report.frameWidth,
+                            frameHeight: report.frameHeight,
+                            framesPerSecond: report.framesPerSecond,
+                        });
+                    }
+
+                    if (report.type === "data-channel") {
+                        dataChannels.push({
+                            label: report.label,
+                            state: report.state,
+                            messagesReceived: report.messagesReceived,
+                            bytesReceived: report.bytesReceived,
+                            messagesSent: report.messagesSent,
+                        });
+                    }
+                }
+
+                window.ws?.sendJson({
+                    type: "WebRTCReceivePathStats",
+                    peerConnectionId,
+
+                    connectionState: pc.connectionState,
+                    iceConnectionState: pc.iceConnectionState,
+                    iceGatheringState: pc.iceGatheringState,
+                    signalingState: pc.signalingState,
+
+                    hasLocalDescription: !!pc.localDescription,
+                    hasRemoteDescription: !!pc.remoteDescription,
+
+                    currentLocalDescriptionType:
+                        pc.currentLocalDescription?.type ?? null,
+                    currentRemoteDescriptionType:
+                        pc.currentRemoteDescription?.type ?? null,
+                    pendingLocalDescriptionType:
+                        pc.pendingLocalDescription?.type ?? null,
+                    pendingRemoteDescriptionType:
+                        pc.pendingRemoteDescription?.type ?? null,
+
+                    selectedPair: selectedPair && {
+                        state: selectedPair.state,
+                        nominated: selectedPair.nominated,
+                        bytesSent: selectedPair.bytesSent,
+                        bytesReceived: selectedPair.bytesReceived,
+                        currentRoundTripTime: selectedPair.currentRoundTripTime,
+                        localCandidateId: selectedPair.localCandidateId,
+                        remoteCandidateId: selectedPair.remoteCandidateId,
+                    },
+                    localCandidate: localCandidate && {
+                        candidateType: localCandidate.candidateType,
+                        protocol: localCandidate.protocol,
+                        address: localCandidate.address,
+                        port: localCandidate.port,
+                    },
+                    remoteCandidate: remoteCandidate && {
+                        candidateType: remoteCandidate.candidateType,
+                        protocol: remoteCandidate.protocol,
+                        address: remoteCandidate.address,
+                        port: remoteCandidate.port,
+                    },
+                    transports,
+                    inboundAudio,
+                    inboundVideo,
+                    dataChannels,
+                });
+            } catch (error) {
+                window.ws?.sendJson({
+                    type: "WebRTCReceivePathStatsError",
+                    peerConnectionId,
+                    error: error?.message ?? String(error),
+                });
+            }
+        };
+
+        const receivePathStatsInterval = setInterval(() => {
+            collectReceivePathStats(peerConnection);
+        }, 60000);
     },
     onDataChannelCreate: (dataChannel, peerConnection) => {
         realConsole?.log('New DataChannel created:', dataChannel);
@@ -2850,12 +3542,22 @@ if (window.initialData.addClickRipple) {
 
 
 
+const mediaControlCameraButtonIds = ["video-button"]
+const mediaControlMicButtonIds = ["microphone-button", "mic-button"]
+const mediaControlScreenshareButtonIds = ["screenshare-button", "share-button"]
+
+// Teams uses different element ids for these controls depending on the client version,
+// so match on any of the known ids combined with the aria-label.
+function mediaControlSelector(ids, ariaLabel, tagName) {
+    return ids.map(id => `${tagName}[id="${id}"][aria-label="${ariaLabel}"]`).join(", ");
+}
+
 async function turnOnCamera() {
     // Click camera button to turn it on
     let cameraButton = null;
     const numAttempts = 30;
     for (let i = 0; i < numAttempts; i++) {
-        cameraButton = document.querySelector('button[aria-label="Turn camera on"]') || document.querySelector('div[aria-label="Turn camera on"]');
+        cameraButton = document.querySelector(mediaControlSelector(mediaControlCameraButtonIds, "Turn camera on", "button")) || document.querySelector(mediaControlSelector(mediaControlCameraButtonIds, "Turn camera on", "div"));
         if (cameraButton) {
             break;
         }
@@ -2880,7 +3582,7 @@ async function turnOnCamera() {
 
 function turnOnMic() {
     // Click microphone button to turn it on
-    const microphoneButton = document.querySelector('button[aria-label="Unmute mic"]');
+    const microphoneButton = document.querySelector(mediaControlSelector(mediaControlMicButtonIds, "Unmute mic", "button"));
     if (microphoneButton) {
         console.log("Clicking the microphone button to turn it on");
         microphoneButton.click();
@@ -2889,56 +3591,16 @@ function turnOnMic() {
 
 function turnOffMic() {
     // Click microphone button to turn it on
-    const microphoneButton = document.querySelector('button[aria-label="Mute mic"]');
+    const microphoneButton = document.querySelector(mediaControlSelector(mediaControlMicButtonIds, "Mute mic", "button"));
     if (microphoneButton) {
         console.log("Clicking the microphone button to turn it off");
         microphoneButton.click();
-    }
-}
-
-function turnOnMicAndCamera() {
-    // Click microphone button to turn it on
-    const microphoneButton = document.querySelector('button[aria-label="Unmute mic"]');
-    if (microphoneButton) {
-        console.log("Clicking the microphone button to turn it on");
-        microphoneButton.click();
-    } else {
-        console.log("Microphone button not found");
-    }
-
-    // Click camera button to turn it on
-    const cameraButton = document.querySelector('button[aria-label="Turn camera on"]');
-    if (cameraButton) {
-        console.log("Clicking the camera button to turn it on");
-        cameraButton.click();
-    } else {
-        console.log("Camera button not found");
-    }
-}
-
-function turnOffMicAndCamera() {
-    // Click microphone button to turn it off
-    const microphoneButton = document.querySelector('button[aria-label="Mute mic"]');
-    if (microphoneButton) {
-        console.log("Clicking the microphone button to turn it off");
-        microphoneButton.click();
-    } else {
-        console.log("Microphone off button not found");
-    }
-
-    // Click camera button to turn it off
-    const cameraButton = document.querySelector('button[aria-label="Turn camera off"]');
-    if (cameraButton) {
-        console.log("Clicking the camera button to turn it off");
-        cameraButton.click();
-    } else {
-        console.log("Camera off button not found");
     }
 }
 
 function turnOffCamera() {
     // Click camera button to turn it off
-    const cameraButton = document.querySelector('button[aria-label="Turn camera off"]');
+    const cameraButton = document.querySelector(mediaControlSelector(mediaControlCameraButtonIds, "Turn camera off", "button"));
     if (cameraButton) {
         console.log("Clicking the camera button to turn it off");
         cameraButton.click();
@@ -2948,75 +3610,26 @@ function turnOffCamera() {
 }
 
 const turnOnMicArialLabel = "Unmute mic"
-const turnOnScreenshareButtonId = "screenshare-button"
-const turnOnScreenshareButtonAlternateId = "share-button"
 const turnOffMicArialLabel = "Turn off microphone"
 const turnOffScreenshareAriaLabel = "Stop sharing"
 
-function turnOnMicAndScreenshare() {
-    // Click microphone button to turn it on
-    const microphoneButton = document.querySelector(`button[aria-label="${turnOnMicArialLabel}"]`);
-    if (microphoneButton) {
-        console.log("Clicking the microphone button to turn it on");
-        microphoneButton.click();
-    } else {
-        console.log("Microphone button not found");
-        window.ws.sendJson({
-            turnOnMicAndScreenshareError: "Microphone button not found in turnOnMicAndScreenshare"
-        });
-    }
-
-    // Click screenshare button to turn it on
-    const screenshareButton = document.querySelector(`button[id="${turnOnScreenshareButtonId}"]`) || document.querySelector(`button[id="${turnOnScreenshareButtonAlternateId}"]`);
-    if (screenshareButton) {
-        console.log("Clicking the screenshare button to turn it on");
-        screenshareButton.click();
-    } else {
-        console.log("Screenshare button not found");
-        window.ws.sendJson({
-            turnOnMicAndScreenshareError: "Screenshare button not found in turnOnMicAndScreenshare"
-        });
-    }
-}
-
-function turnOffMicAndScreenshare() {
-    // Click microphone button to turn it off
-    const microphoneButton = document.querySelector(`button[aria-label="${turnOffMicArialLabel}"]`);
-    if (microphoneButton) {
-        console.log("Clicking the microphone button to turn it off");
-        microphoneButton.click();
-    } else {
-        console.log("Microphone off button not found");
-    }
-
-    // Click screenshare button to turn it off
-    const screenshareButton = document.querySelector(`button[aria-label="${turnOffScreenshareAriaLabel}"]`);
-    if (screenshareButton) {
-        console.log("Clicking the screenshare button to turn it off");
-        screenshareButton.click();
-    } else {
-        console.log("Screenshare off button not found");
-    }
-}
-
-
 function turnOnScreenshare() {
     // Click screenshare button to turn it on
-    const screenshareButton = document.querySelector(`button[id="${turnOnScreenshareButtonId}"]`) || document.querySelector(`button[id="${turnOnScreenshareButtonAlternateId}"]`);
+    const screenshareButton = document.querySelector(mediaControlScreenshareButtonIds.map(id => `button[id="${id}"]`).join(", "));
     if (screenshareButton) {
         console.log("Clicking the screenshare button to turn it on");
         screenshareButton.click();
     } else {
         console.log("Screenshare button not found");
         window.ws.sendJson({
-            turnOnMicAndScreenshareError: "Screenshare button not found in turnOnMicAndScreenshare"
+            turnOnScreenshareError: "Screenshare button not found in turnOnScreenshare"
         });
     }
 }
 
 function turnOffScreenshare() {
     // Click screenshare button to turn it off
-    const screenshareButton = document.querySelector(`button[aria-label="${turnOffScreenshareAriaLabel}"]`);
+    const screenshareButton = document.querySelector(mediaControlSelector(mediaControlScreenshareButtonIds, turnOffScreenshareAriaLabel, "button"));
     if (screenshareButton) {
         console.log("Clicking the screenshare button to turn it off");
         screenshareButton.click();
@@ -3054,6 +3667,18 @@ window.botOutputManager = botOutputManager;
                         {
                             if (event?.message)
                             {
+                                const threadId = window.callManager?.getThreadId();
+                                const convIdFromEvent = event.convId ?? event.message?.conversationId;
+                                if (!threadId || (convIdFromEvent !== threadId))
+                                {
+                                    window.ws?.sendJson({
+                                        type: 'ChatMessageHadWrongThreadId',
+                                        message: event,
+                                        expectedThreadId: threadId,
+                                    });
+                                    continue;
+                                }
+
                                 realConsole?.log('chatMessage', event.message);
                                 window.chatMessageManager?.handleChatMessage(event.message);
                             }
@@ -3066,6 +3691,30 @@ window.botOutputManager = botOutputManager;
         return _bind.apply(this, [thisArg, ...args]);
     };
 })();
+
+class ConnectionStateManager {
+    constructor() {
+        this.didMeetingEndButShouldRetryJoin = false;
+        // Set to false by the python side once it stops polling getDidMeetingEndButShouldRetryJoin
+        this.canRetryJoinOnMeetingEnd = true;
+    }
+
+    getDidMeetingEndButShouldRetryJoin() {
+        return this.didMeetingEndButShouldRetryJoin;
+    }
+
+    setDidMeetingEndButShouldRetryJoin(didMeetingEndButShouldRetryJoin) {
+        this.didMeetingEndButShouldRetryJoin = didMeetingEndButShouldRetryJoin;
+    }
+
+    getCanRetryJoinOnMeetingEnd() {
+        return this.canRetryJoinOnMeetingEnd;
+    }
+
+    disableRetryJoinOnMeetingEnd() {
+        this.canRetryJoinOnMeetingEnd = false;
+    }
+}
 
 class CallManager {
     constructor() {
@@ -3095,6 +3744,15 @@ class CallManager {
         }
     }
 
+    getThreadId() {
+        this.setActiveCall();
+        if (!this.activeCall) {
+            return;
+        }
+
+        return this.activeCall.threadId;
+    }
+
     getCallId() {
         this.setActiveCall();
         if (!this.activeCall) {
@@ -3102,6 +3760,33 @@ class CallManager {
         }
 
         return this.activeCall._callId;
+    }
+
+    getCallState() {
+        this.setActiveCall();
+        if (!this.activeCall) {
+            return;
+        }
+
+        // Call states:
+        // 0 - None
+        // 1 - Notified
+        // 2 - Connecting
+        // 3 - Connected
+        // 4 - LocalHold
+        // 5 - RemoteHold
+        // 6 - Disconnecting
+        // 7 - Disconnected
+        // 8 - Observing
+        // 9 - EarlyMedia
+        // 10 - InLobby
+        // 11 - Preheating
+        // 12 - Preheated
+        // 13 - Staging
+        // 14 - NegotiatingEncryption
+        // 15 - NegotiatingEncryptionLobby
+
+        return this.activeCall.state;
     }
 
     getCurrentUserId() {
@@ -3115,6 +3800,174 @@ class CallManager {
         // return this.activeCall.currentUserSkypeIdentity?.id;
     }
 
+    async disableIncomingVideoForSignedInUser(steps) {
+        this.setActiveCall();
+        if (!this.activeCall) {
+            steps.push('signed-in user method: no active call');
+            return false;
+        }
+
+        if (!window.msteamscalling?.deref) {
+            steps.push('signed-in user method: window.msteamscalling.deref not available');
+            return false;
+        }
+
+        const microsoftCalling = window.msteamscalling.deref();
+        const callTogglingService = microsoftCalling?.callTogglingService;
+        if (!callTogglingService) {
+            steps.push('signed-in user method: callTogglingService not available');
+            return false;
+        }
+
+        const call = this.activeCall;
+
+        const initialIsIncomingVideoOn = callTogglingService.isIncomingVideoOn(call);
+        if (!initialIsIncomingVideoOn) {
+            steps.push('signed-in user method: incoming video already off (isIncomingVideoOn returned ' + String(initialIsIncomingVideoOn) + ')');
+            return true;
+        }
+
+        callTogglingService.toggleIncomingVideo(call);
+        steps.push('signed-in user method: called toggleIncomingVideo');
+
+        const startedAt = Date.now();
+        const deadline = startedAt + 5000;
+        let lastIsIncomingVideoOn;
+        while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 250));
+            lastIsIncomingVideoOn = callTogglingService.isIncomingVideoOn(call);
+            if (!lastIsIncomingVideoOn) {
+                steps.push('signed-in user method: verified incoming video off after ' + (Date.now() - startedAt) + 'ms (isIncomingVideoOn returned ' + String(lastIsIncomingVideoOn) + ')');
+                return true;
+            }
+        }
+
+        steps.push('signed-in user method: incoming video still on after 5000ms (isIncomingVideoOn returned ' + String(lastIsIncomingVideoOn) + ')');
+        return false;
+    }
+
+    findCallingScreenLayoutContext() {
+        for (const el of document.querySelectorAll('*')) {
+            const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+            if (!fiberKey) continue;
+            for (let fiber = el[fiberKey]; fiber; fiber = fiber.return) {
+                const value = fiber.memoizedProps?.value;
+                if (value && typeof value.updateCallingScreenLayout === 'function' && value.callingScreenLayout)
+                    return value;
+            }
+        }
+        return null;
+    }
+
+    async disableIncomingVideoForAnonymousUser(steps) {
+        const ctx = this.findCallingScreenLayoutContext();
+        if (!ctx) {
+            steps.push('anonymous user method: callingScreenLayout context not found');
+            return false;
+        }
+
+        if (ctx.callingScreenLayout.isIncomingVideoOn === false) {
+            steps.push('anonymous user method: incoming video already off');
+            return true;
+        }
+
+        await ctx.updateCallingScreenLayout({ isIncomingVideoOn: false });
+        steps.push('anonymous user method: called updateCallingScreenLayout({ isIncomingVideoOn: false })');
+
+        // The context value is replaced on re-render, so look it up again on each poll.
+        const startedAt = Date.now();
+        const deadline = startedAt + 5000;
+        while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 250));
+            if (this.findCallingScreenLayoutContext()?.callingScreenLayout?.isIncomingVideoOn === false) {
+                steps.push('anonymous user method: verified incoming video off after ' + (Date.now() - startedAt) + 'ms');
+                return true;
+            }
+        }
+
+        steps.push('anonymous user method: incoming video still on after 5000ms');
+        return false;
+    }
+
+    async disableIncomingVideo() {
+        const out = { ok: false, steps: [] };
+
+        try {
+            this.setActiveCall();
+            if (!this.activeCall) {
+                out.error = 'no active call';
+                return out;
+            }
+
+            try {
+                if (await this.disableIncomingVideoForSignedInUser(out.steps)) {
+                    out.ok = true;
+                    return out;
+                }
+            } catch (e) {
+                out.steps.push('signed-in user method: threw ' + ((e && e.message) ? e.message : String(e)));
+            }
+
+            try {
+                if (await this.disableIncomingVideoForAnonymousUser(out.steps)) {
+                    out.ok = true;
+                    return out;
+                }
+            } catch (e) {
+                out.steps.push('anonymous user method: threw ' + ((e && e.message) ? e.message : String(e)));
+            }
+
+            out.error = 'all methods failed to disable incoming video';
+        } catch (e) {
+            out.error = 'disableIncomingVideo threw: ' + ((e && e.message) ? e.message : String(e));
+        }
+
+        return out;
+    }
+
+    disableVideoEffects() {
+        try {
+            this.setActiveCall();
+            if (!this.activeCall) {
+                return false;
+            }
+
+            const videoEffectManager = this.activeCall?.mediaAgent?.deviceManager?.effectsManagerInternal?.videoEffectManager;
+            if (!videoEffectManager) {
+                return false;
+            }
+
+            if (!videoEffectManager.__attendeeIsEffectEnabledPatched) {
+                Object.defineProperty(videoEffectManager, "isEffectEnabled", {
+                    get() {
+                        return false;
+                    },
+                    configurable: true,
+                });
+                videoEffectManager.__attendeeIsEffectEnabledPatched = true;
+            }
+            return true;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    getUnmutedParticipantIds() {
+        this.setActiveCall();
+        if (!this.activeCall) {
+            return [];
+        }
+        if (!this.activeCall.participants) {
+            return [];
+        }
+        const unmutedParticipantIds = new Set();
+        this.activeCall.participants.forEach(participant => {
+            if (participant.isServerMuted === false && participant.displayName) {
+                unmutedParticipantIds.add(participant.id);
+            }
+        });
+        return Array.from(unmutedParticipantIds);
+    }
 
     getSpeakingParticipantIds(contributingSources) {
         this.setActiveCall();
@@ -3135,53 +3988,20 @@ class CallManager {
         return speakingParticipantIds;
     }
 
-    syncParticipants() {
+    getRemoteParticipants() {
         this.setActiveCall();
         if (!this.activeCall) {
-            return;
+            return [];
         }
+        return this.activeCall.participants || [];
+    }
 
-        const participantsRaw = this.activeCall.participants;
-        const participants = participantsRaw.map(participant => {
-            return {
-                id: participant.id,
-                displayName: participant.displayName,
-                endpoints: participant.endpoints,
-                meetingRole: participant.meetingRole
-            };
-        }).filter(participant => participant.displayName);
-
-        for (const participant of participants) {
-            const endpoints = (participant?.endpoints?.endpointDetails || []).map(endpoint => {
-                if (!endpoint.endpointId) {
-                    return null;
-                }
-
-                if (!endpoint.mediaStreams) {
-                    return null;
-                }
-
-                return [
-                    endpoint.endpointId,
-                    {
-                        call: {
-                            mediaStreams: endpoint.mediaStreams
-                        }
-                    }
-                ]
-            }).filter(endpoint => endpoint);
-
-            // Transform this funny format of a participant into Teams "standard" format
-            const participantConverted = {
-                details: {id: participant.id, displayName: participant.displayName},
-                meetingRole: participant.meetingRole,
-                state: "active",
-                endpoints: Object.fromEntries(endpoints),
-                callId: this.getCallId()
-            };
-            window.userManager.singleUserSynced(participantConverted);
-            syncVirtualStreamsFromParticipant(participantConverted);
+    getLocalParticipant() {
+        this.setActiveCall();
+        if (!this.activeCall) {
+            return null;
         }
+        return this.activeCall.localSignalingParticipant || null;
     }
 
     enableClosedCaptions() {
@@ -3231,7 +4051,7 @@ class CallManager {
                         if (this.activeCall && this.activeCall.getClosedCaptionsLanguage) {
                             const currentLanguage = this.activeCall.getClosedCaptionsLanguage();
                             if (currentLanguage !== this.closedCaptionLanguage) {
-                                const enforcementTimeoutSeconds = window.teamsInitialData.enforceTeamsClosedCaptionsLanguageTimeoutSeconds || 0;
+                                const enforcementTimeoutSeconds = window.teamsInitialData.teamsClosedCaptionsLanguageEnforcementDurationSeconds || 0;
                                 const elapsedSeconds = (Date.now() - this.closedCaptionLanguageIntervalStartTime) / 1000;
                                 const withinEnforcementWindow = elapsedSeconds < enforcementTimeoutSeconds;
 
@@ -3258,8 +4078,205 @@ class CallManager {
     }
 }
 
+class ParticipantsPoller {
+    static tickIntervalMs = 200;
+    static normalPollIntervalMs = 1000;
+    static fastPollIntervalMs = 200;
+    static fastPollWindowMs = 1000;
+    // Participants in this state are waiting in the lobby and have not joined the meeting yet
+    static lobbyParticipantState = 7;
+
+    constructor() {
+        this.interval = null;
+        this.errorPollingParticipantsTicker = 0;
+        this.previousParticipantsChangeKey = null;
+        this.lastLogAllParticipantsRawTime = 0;
+        this.lastPollParticipantsTime = 0;
+        this.fastPollUntilTime = 0;
+    }
+
+    start() {
+        if (this.interval) {
+            return;
+        }
+        this.interval = setInterval(() => {
+            try {
+                const now = Date.now();
+                const pollIntervalMs = now < this.fastPollUntilTime ? ParticipantsPoller.fastPollIntervalMs : ParticipantsPoller.normalPollIntervalMs;
+                if (now - this.lastPollParticipantsTime < pollIntervalMs) {
+                    return;
+                }
+                this.lastPollParticipantsTime = now;
+                this.pollParticipants();
+            } catch (error) {
+                if (this.errorPollingParticipantsTicker % 500 === 0)
+                {
+                    window.ws?.sendJson({
+                        type: 'ErrorPollingParticipants',
+                        error: error.message
+                    });
+                }
+                this.errorPollingParticipantsTicker++;
+            }
+        }, ParticipantsPoller.tickIntervalMs);
+    }
+
+    // A roster update means the participant list is probably changing, so poll at the faster
+    // rate for a short window to pick up the changes sooner.
+    enableFastPolling() {
+        this.fastPollUntilTime = Date.now() + ParticipantsPoller.fastPollWindowMs;
+    }
+
+    pollParticipants() {
+        let participantsRaw = window.callManager.getRemoteParticipants();
+        
+        const localParticipantRaw = window.callManager.getLocalParticipant();
+
+        if (localParticipantRaw) {
+            // Local participant has different nesting of endpoint details vs remote participants
+            participantsRaw = [...participantsRaw, {
+                id: localParticipantRaw.id,
+                displayName: localParticipantRaw.displayName,
+                endpoints: {endpointDetails: localParticipantRaw.endpointDetails},
+                meetingRole: localParticipantRaw.meetingRole
+            }];
+        }
+
+        if (!participantsRaw) {
+            return;
+        }
+
+        const now = Date.now();
+        if (now - this.lastLogAllParticipantsRawTime >= 600 * 1000) {
+            this.lastLogAllParticipantsRawTime = now;
+            window.ws?.sendJson({
+                type: 'AllParticipantsRaw',
+                participantsRaw: participantsRaw.slice(0, 100).map(participant => ({
+                    id: participant.id,
+                    displayName: participant.displayName,
+                    state: participant.state,
+                }))
+            });
+        }
+
+        // Filter out participants in the lobby or with no display name. The bot's participant will not be affected
+        const participants = participantsRaw.filter(participant =>
+            participant.displayName && participant.state !== ParticipantsPoller.lobbyParticipantState
+        ).map(participant => {
+            return {
+                id: participant.id,
+                displayName: participant.displayName,
+                endpoints: participant.endpoints,
+                meetingRole: participant.meetingRole
+            };
+        });
+
+        const participantsConverted = participants.map(participant => {
+            const endpoints = (participant?.endpoints?.endpointDetails || []).map(endpoint => {
+                if (!endpoint.endpointId) {
+                    return null;
+                }
+
+                if (!endpoint.mediaStreams) {
+                    return null;
+                }
+
+                return [
+                    endpoint.endpointId,
+                    {
+                        call: {
+                            mediaStreams: endpoint.mediaStreams
+                        }
+                    }
+                ]
+            }).filter(endpoint => endpoint);
+
+            // Transform this funny format of a participant into Teams "standard" format
+            return {
+                details: {id: participant.id, displayName: participant.displayName},
+                meetingRole: participant.meetingRole,
+                state: "active",
+                endpoints: Object.fromEntries(endpoints),
+                callId: window.callManager.getCallId()
+            };
+        });
+
+        const changeKey = JSON.stringify(participantsConverted.map(p => [
+            p.details.id,
+            p.details.displayName,
+            p.meetingRole,
+            Object.entries(p.endpoints).map(([endpointId, e]) =>
+                [endpointId, e.call.mediaStreams.map(s => [s.sourceId, s.type, s.direction])]
+            )
+        ]));
+        if (changeKey === this.previousParticipantsChangeKey) {
+            return;
+        }
+        this.previousParticipantsChangeKey = changeKey;
+
+        window.userManager.multipleUsersSynced(participantsConverted);
+        for (const participantConverted of participantsConverted) {
+            syncVirtualStreamsFromParticipant(participantConverted);
+        }
+    }
+}
+
+class CallStatePoller {
+    static pollIntervalMs = 1000;
+
+    constructor() {
+        this.interval = null;
+        this.errorPollingCallStateTicker = 0;
+        this.previousCallState = undefined;
+    }
+
+    start() {
+        if (this.interval) {
+            return;
+        }
+        this.interval = setInterval(() => {
+            try {
+                this.pollCallState();
+            } catch (error) {
+                if (this.errorPollingCallStateTicker % 500 === 0)
+                {
+                    window.ws?.sendJson({
+                        type: 'ErrorPollingCallState',
+                        error: error.message
+                    });
+                }
+                this.errorPollingCallStateTicker++;
+            }
+        }, CallStatePoller.pollIntervalMs);
+    }
+
+    pollCallState() {
+        const callState = window.callManager.getCallState();
+        if (callState === this.previousCallState) {
+            return;
+        }
+
+        window.ws?.sendJson({
+            type: 'CallStateChange',
+            previousCallState: this.previousCallState ?? null,
+            callState: callState ?? null,
+            callId: window.callManager.getCallId() ?? null
+        });
+        this.previousCallState = callState;
+    }
+}
+
 const callManager = new CallManager();
 window.callManager = callManager;
+
+const participantsPoller = new ParticipantsPoller();
+window.participantsPoller = participantsPoller;
+
+const callStatePoller = new CallStatePoller();
+window.callStatePoller = callStatePoller;
+
+const connectionStateManager = new ConnectionStateManager();
+window.connectionStateManager = connectionStateManager;
 
 if (window.teamsInitialData?.shouldLogNetworkRequests) {
     
