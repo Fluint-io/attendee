@@ -1,3 +1,29 @@
+// Google Meet uses localstorage to store its preferences. We can use this to disable incoming video.
+const disableIncomingVideoViaLocalStorage = () => {
+    const MEET_PREFERENCES_LOCAL_STORAGE_KEY = "meet-preferences";
+
+    // It's a protobuf. The only non-null field we need to write is the nested field at index 8, 5.
+    // This controls the video receive resolution. Setting it to 1 will disable incoming video.
+    const preferencesArray = Array(9).fill(null);
+    preferencesArray[8] = Array(6).fill(null);
+    preferencesArray[8][5] = 1;
+    
+    // You need to stringify twice to get a quoted string.
+    const DISABLED_INCOMING_VIDEO_PREFERENCES = JSON.stringify(JSON.stringify(preferencesArray));
+
+    try {
+        localStorage.setItem(MEET_PREFERENCES_LOCAL_STORAGE_KEY, DISABLED_INCOMING_VIDEO_PREFERENCES);
+        console.log("Disabled incoming video via setting localstorage");
+    } catch (error) {
+        // localStorage is unavailable in opaque origins, which this script also runs in
+        console.log("Failed to disable incoming video via setting localstorage", error);
+    }
+};
+
+if (window.googleMeetInitialData.disableIncomingVideo) {
+    disableIncomingVideoViaLocalStorage();
+}
+
 const handleVideoTrackForRealTimePerParticipantVideo = async ({ track, streams }) => {
     try {
         const firstStreamId = streams?.[0]?.id;
@@ -282,9 +308,9 @@ class StyleManager {
 
     checkNeededInteractions() {
         // Check for recording notification dialog
-        const recordingDialog = document.querySelector('div[aria-modal="true"][role="dialog"]');
+        const recordingDialog = document.querySelector('div[aria-modal="true"][role="dialog"], div[aria-modal="true"][role="alertdialog"]');
         
-        if (recordingDialog && (recordingDialog.textContent.includes('This video call is being recorded') || recordingDialog.textContent.includes('Others may see your video differently') || recordingDialog.textContent.includes('This video call is being transcribed') || recordingDialog.textContent.includes('Gemini is taking notes'))) {           
+        if (recordingDialog && (recordingDialog.textContent.includes('This video call is being recorded') || recordingDialog.textContent.includes('Others may see your video differently') || recordingDialog.textContent.includes('This video call is being transcribed') || recordingDialog.textContent.includes('Gemini is taking notes') || recordingDialog.textContent.includes('This meeting is being captured'))) {           
             // Find and click the "Join now" button (usually the confirm/OK button)
             const joinNowButton = recordingDialog.querySelector('button[data-mdc-dialog-action="ok"]');
             
@@ -310,11 +336,19 @@ class StyleManager {
         }
 
         // Check if bot has been removed from the meeting
-        const removedFromMeetingElement = document.querySelector('.roSPhc');
-        if (removedFromMeetingElement && (removedFromMeetingElement.textContent.includes('You\'ve been removed from the meeting') || removedFromMeetingElement.textContent.includes('Your host ended the meeting for everyone'))) {
+        const callEndedMessageElement = document.querySelector('.roSPhc');
+        if (callEndedMessageElement && callEndedMessageElement.textContent.includes('You\'ve been removed from the meeting')) {
             window.ws.sendJson({
                 type: 'MeetingStatusChange',
                 change: 'removed_from_meeting'
+            });
+        }
+
+        // Check if the call ended for reasons other than the bot being removed
+        if (callEndedMessageElement && (callEndedMessageElement.textContent.includes('The call ended because everyone left') || callEndedMessageElement.textContent.includes('Your host ended the meeting for everyone'))) {
+            window.ws.sendJson({
+                type: 'MeetingStatusChange',
+                change: 'meeting_ended'
             });
         }
     }
@@ -772,6 +806,19 @@ class StyleManager {
         }
 
         console.log('Started StyleManager');
+
+        // If we have a room sync source participant, then start streaming its
+        // media into the meeting. The adapter is only loaded when this is
+        // configured, so guard on both the config and the function existing.
+        if (window.initialData.roomSyncSourceParticipantConfiguration && window.streamRoomSyncSourceParticipant) {
+            window.streamRoomSyncSourceParticipant().catch((error) => {
+                console.error('Failed to stream room sync source participant:', error);
+                window.ws?.sendJson({
+                    type: 'Error',
+                    message: 'Failed to stream room sync source participant: ' + error.message
+                });
+            });
+        }
     }
 
     /*
@@ -911,6 +958,8 @@ class UserManager {
         this.currentUsersMap = new Map();
         this.deviceOutputMap = new Map();
         this.currentUserId = null;
+        // Track the set of parentDeviceIds (real participant deviceIds) currently screen sharing
+        this.activeScreenSharerParentDeviceIds = new Set();
 
         this.ws = ws;
     }
@@ -973,7 +1022,17 @@ class UserManager {
     // constants for meeting status
     MEETING_STATUS = {
         IN_MEETING: 1,
+        IN_WAITING_ROOM: 3,
         NOT_IN_MEETING: 6
+    }
+
+    // The bot's own device id is only learned from a participant roster sync, so
+    // this returns false until the roster includes the bot.
+    currentUserIsInWaitingRoom() {
+        if (!this.currentUserId) return false;
+        const currentUser = this.allUsersMap.get(this.currentUserId);
+        if (!currentUser) return false;
+        return currentUser.status === this.MEETING_STATUS.IN_WAITING_ROOM;
     }
 
     getCurrentUsersInMeeting() {
@@ -1078,6 +1137,35 @@ class UserManager {
                 updatedUsers: updatedUsersToSend
             });
         }
+
+        this.detectScreenShareChanges();
+    }
+
+    detectScreenShareChanges() {
+        const currentScreenSharerParentDeviceIds = new Set(
+            this.getCurrentUsersInMeetingWhoAreScreenSharing().map(user => user.parentDeviceId)
+        );
+        for (const parentDeviceId of currentScreenSharerParentDeviceIds) {
+            if (!this.activeScreenSharerParentDeviceIds.has(parentDeviceId)) {
+                this.ws.sendJson({
+                    type: 'ScreenshareStartStopEvent',
+                    participantId: parentDeviceId,
+                    isScreenshareStart: true,
+                    timestamp: Date.now()
+                });
+            }
+        }
+        for (const parentDeviceId of this.activeScreenSharerParentDeviceIds) {
+            if (!currentScreenSharerParentDeviceIds.has(parentDeviceId)) {
+                this.ws.sendJson({
+                    type: 'ScreenshareStartStopEvent',
+                    participantId: parentDeviceId,
+                    isScreenshareStart: false,
+                    timestamp: Date.now()
+                });
+            }
+        }
+        this.activeScreenSharerParentDeviceIds = currentScreenSharerParentDeviceIds;
     }
 }
 
@@ -1530,6 +1618,9 @@ class RTCInterceptor {
             
             return peerConnection;
         };
+
+        window.RTCPeerConnection.prototype.addTransceiver = originalRTCPeerConnection.prototype.addTransceiver;
+        window.RTCPeerConnection.prototype.addTrack = originalRTCPeerConnection.prototype.addTrack;
     }
 }
 
@@ -1538,7 +1629,7 @@ const messageTypes = [
       {
         name: 'CollectionEvent',
         fields: [
-            { name: 'body', fieldNumber: 1, type: 'message', messageType: 'CollectionEventBody' }
+            { name: 'body', fieldNumber: 1, type: 'message', messageType: 'CollectionEventBody', repeated: true }
         ]
     },
     {
@@ -1620,7 +1711,7 @@ const messageTypes = [
             { name: 'deviceId', fieldNumber: 1, type: 'string' },
             { name: 'fullName', fieldNumber: 2, type: 'string' },
             { name: 'profilePicture', fieldNumber: 3, type: 'string' },
-            { name: 'status', fieldNumber: 4, type: 'varint' }, // in meeting = 1 vs not in meeting = 6. kicked out = 7?
+            { name: 'status', fieldNumber: 4, type: 'varint' }, // in meeting = 1 vs not in meeting = 6. kicked out = 7? denied from lobby = 4?
             { name: 'isCurrentUserString', fieldNumber: 7, type: 'string' }, // Presence of this string indicates that this is the current user. The string itself seems to be a random uuid
             { name: 'displayName', fieldNumber: 29, type: 'string' },
             { name: 'parentDeviceId', fieldNumber: 21, type: 'string' }, // if this is present, then this is a screenshare device. The parentDevice is the person that is sharing
@@ -1818,30 +1909,50 @@ new FetchInterceptor(async (response) => {
 });
 
 const handleCollectionEvent = (event) => {
-  const decodedData = pako.inflate(new Uint8Array(event.data));
-  //console.log(' handleCollectionEventdecodedData', decodedData);
-  // Convert decoded data to base64
-  const base64Data = btoa(String.fromCharCode.apply(null, decodedData));
-  //console.log('Decoded collection event data (base64):', base64Data);
+  try {
+    const decodedData = pako.inflate(new Uint8Array(event.data));
+    //console.log(' handleCollectionEventdecodedData', decodedData);
+    // Convert decoded data to base64
+    // const base64Data = btoa(String.fromCharCode.apply(null, decodedData));
+    //console.log('Decoded collection event data (base64):', base64Data);
 
-  const collectionEvent = messageDecoders['CollectionEvent'](decodedData);
-  
-  const deviceOutputInfoList = collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList;
+    const collectionEvent = messageDecoders['CollectionEvent'](decodedData);
+
+    for (const body of collectionEvent.body || []) {
+      try {
+        handleCollectionEventBody(body);
+      } catch (error) {
+        window.ws?.sendJson({
+          type: 'Error',
+          message: 'Error in handleCollectionEventBody: ' + error.message
+        });
+      }
+    }
+  } catch (error) {
+    window.ws?.sendJson({
+      type: 'Error',
+      message: 'Error in handleCollectionEvent: ' + error.message
+    });
+  }
+};
+
+const handleCollectionEventBody = (body) => {
+  const deviceOutputInfoList = body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList;
   if (deviceOutputInfoList) {
     userManager.updateDeviceOutputs(deviceOutputInfoList);
   }
 
-  const chatMessageWrapper = collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.chatMessageWrapper;
+  const chatMessageWrapper = body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.chatMessageWrapper;
   if (chatMessageWrapper) {
     for (const chatMessage of chatMessageWrapper) {
         window.chatMessageManager?.handleChatMessage(chatMessage);
     }
   }
 
-  //console.log('deviceOutputInfoList', JSON.stringify(collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList));
+  //console.log('deviceOutputInfoList', JSON.stringify(body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList));
   //console.log('usermap', userMap.allUsersMap);
-  //console.log('userInfoList And Event', collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper.userInfoListWrapperAndChatWrapper.userInfoListWrapper);
-  const userInfoList = collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper.userInfoListWrapperAndChatWrapper.userInfoListWrapper?.userInfoList || [];
+  //console.log('userInfoList And Event', body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.userInfoListWrapper);
+  const userInfoList = body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.userInfoListWrapper?.userInfoList || [];
   console.log('userInfoList in collection event', userInfoList);
   // This event is triggered when a single user joins (or leaves) the meeting
   // generally this array only contains a single user

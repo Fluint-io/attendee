@@ -23,8 +23,8 @@ def restart_bot_pod(self, bot_id):
 
     last_bot_event = bot.last_bot_event()
 
-    if last_bot_event.event_type != BotEventTypes.JOIN_REQUESTED:
-        logger.info(f"Bot {bot_id} is not in JOINING state, so not restarting pod")
+    if last_bot_event.event_type not in (BotEventTypes.JOIN_REQUESTED, BotEventTypes.STAGED):
+        logger.info(f"Bot {bot_id} is not in JOINING or STAGED state, so not restarting pod")
         return
 
     # Tear down any existing infra for this bot so it can be re-launched cleanly.

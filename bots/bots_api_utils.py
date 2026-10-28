@@ -69,7 +69,7 @@ def build_internal_site_url(path=""):
     When unset, fall back to the public site URL, preserving behavior for
     deployments that do not configure an internal route.
     """
-    internal_site_domain = os.getenv("INTERNAL_SITE_DOMAIN")
+    internal_site_domain = settings.INTERNAL_SITE_DOMAIN
     if internal_site_domain:
         return f"http://{internal_site_domain}{path}"
 
@@ -243,6 +243,7 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
     callback_settings = serializer.validated_data["callback_settings"]
     external_media_storage_settings = serializer.validated_data["external_media_storage_settings"]
     voice_agent_settings = serializer.validated_data["voice_agent_settings"]
+    room_sync_settings = serializer.validated_data["room_sync_settings"]
     kubernetes_settings = serializer.validated_data["kubernetes_settings"]
     initial_state = BotStates.SCHEDULED if join_at else BotStates.READY
 
@@ -267,6 +268,7 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
         "callback_settings": callback_settings,
         "external_media_storage_settings": external_media_storage_settings,
         "voice_agent_settings": voice_agent_settings,
+        "room_sync_settings": room_sync_settings,
         "kubernetes_settings": kubernetes_settings,
     }
 

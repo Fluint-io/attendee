@@ -9,7 +9,7 @@ from celery import shared_task
 logger = logging.getLogger(__name__)
 
 from bots.models import Credentials, RecordingManager, TranscriptionFailureReasons, TranscriptionProviders, Utterance, WebhookTriggerTypes
-from bots.transcription_utils import get_transcription_via_assemblyai_from_mp3, is_retryable_failure
+from bots.transcription_utils import get_transcription_via_assemblyai_from_mp3, get_transcription_via_deepgram_from_audio_data, is_retryable_failure
 from bots.utils import pcm_to_mp3
 from bots.webhook_payloads import utterance_webhook_payload
 from bots.webhook_utils import trigger_webhook
@@ -168,11 +168,18 @@ def get_transcription_via_gladia(utterance):
 
     transcribe_url = "https://api.gladia.io/v2/pre-recorded"
     transcribe_request_body = {"audio_url": audio_url}
-    if transcription_settings.gladia_enable_code_switching():
-        transcribe_request_body["enable_code_switching"] = True
-        transcribe_request_body["code_switching_config"] = {
-            "languages": transcription_settings.gladia_code_switching_languages(),
-        }
+    language_config = transcription_settings.gladia_language_config()
+    if language_config:
+        transcribe_request_body["language_config"] = language_config
+    for key, value in [
+        ("model", transcription_settings.gladia_model()),
+        ("custom_vocabulary", transcription_settings.gladia_custom_vocabulary()),
+        ("custom_vocabulary_config", transcription_settings.gladia_custom_vocabulary_config()),
+        ("custom_spelling", transcription_settings.gladia_custom_spelling()),
+        ("custom_spelling_config", transcription_settings.gladia_custom_spelling_config()),
+    ]:
+        if value is not None:
+            transcribe_request_body[key] = value
     transcribe_response = requests.request("POST", transcribe_url, headers=headers, json=transcribe_request_body)
 
     if transcribe_response.status_code != 200 and transcribe_response.status_code != 201:
@@ -217,6 +224,12 @@ def get_transcription_via_gladia(utterance):
                 if "words" in utterance:
                     all_words.extend(utterance["words"])
             transcription["words"] = all_words
+
+            # Gladia sorts languages from most to least detected, so the first one is the dominant language.
+            # Fall back to the language of the first utterance that has one.
+            languages = transcription.get("languages") or []
+            first_utterance_language = next((utterance["language"] for utterance in transcription["utterances"] if utterance.get("language")), None)
+            transcription["language"] = languages[0] if languages else first_utterance_language
             del transcription["utterances"]
 
             return transcription, None
@@ -240,65 +253,15 @@ def get_transcription_via_gladia(utterance):
 
 
 def get_transcription_via_deepgram(utterance):
-    from deepgram import (
-        DeepgramApiError,
-        DeepgramClient,
-        DeepgramClientOptions,
-        FileSource,
-        PrerecordedOptions,
+    return get_transcription_via_deepgram_from_audio_data(
+        identifier=f"utterance {utterance.id}",
+        transcription_settings=utterance.transcription_settings,
+        recording=utterance.recording,
+        retrieve_pcm_data_callback=lambda: (
+            utterance.get_audio_blob().tobytes(),
+            {"encoding": "linear16", "sample_rate": utterance.get_sample_rate()},
+        ),
     )
-
-    recording = utterance.recording
-    transcription_settings = utterance.transcription_settings
-    payload: FileSource = {
-        "buffer": utterance.get_audio_blob().tobytes(),
-    }
-
-    deepgram_model = transcription_settings.deepgram_model()
-
-    options = PrerecordedOptions(
-        model=deepgram_model,
-        smart_format=True,
-        language=transcription_settings.deepgram_language(),
-        detect_language=transcription_settings.deepgram_detect_language(),
-        keyterm=transcription_settings.deepgram_keyterms(),
-        keywords=transcription_settings.deepgram_keywords(),
-        encoding="linear16",  # for 16-bit PCM
-        sample_rate=utterance.get_sample_rate(),
-        redact=transcription_settings.deepgram_redaction_settings(),
-        replace=transcription_settings.deepgram_replace_settings(),
-    )
-
-    deepgram_credentials_record = recording.bot.project.credentials.filter(credential_type=Credentials.CredentialTypes.DEEPGRAM).first()
-    if not deepgram_credentials_record:
-        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND}
-
-    deepgram_credentials = deepgram_credentials_record.get_credentials()
-    if not deepgram_credentials:
-        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND}
-
-    deepgram_base_url = transcription_settings.deepgram_base_url()
-    if deepgram_base_url:
-        logger.info(f"Using Deepgram base URL {deepgram_base_url} for transcription")
-        config = DeepgramClientOptions(url=deepgram_base_url)
-        deepgram = DeepgramClient(deepgram_credentials["api_key"], config)
-    else:
-        deepgram = DeepgramClient(deepgram_credentials["api_key"])
-
-    try:
-        response = deepgram.listen.rest.v("1").transcribe_file(payload, options)
-    except DeepgramApiError as e:
-        original_error_json = json.loads(e.original_error)
-        if original_error_json.get("err_code") == "INVALID_AUTH":
-            return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_INVALID}
-        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error_code": original_error_json.get("err_code"), "error_json": original_error_json}
-
-    logger.info(f"Deepgram transcription complete with model {deepgram_model}")
-    alternatives = response.results.channels[0].alternatives
-    if len(alternatives) == 0:
-        logger.info(f"Deepgram transcription with model {deepgram_model} had no alternatives, returning empty transcription")
-        return {"transcript": "", "words": []}, None
-    return json.loads(alternatives[0].to_json()), None
 
 
 def get_transcription_via_openai(utterance):
