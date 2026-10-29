@@ -1077,6 +1077,7 @@ class WebBotAdapter(BotAdapter):
             except UiRetryableExpectedException as e:
                 if num_retries >= max_retries:
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is retryable but the number of retries exceeded the limit and there were {num_expected_exceptions} expected exceptions, so returning")
+                    self.before_giving_up_join(e.step)
                     self.send_debug_screenshot_message(step=e.step, exception=e, inner_exception=e.inner_exception)
                     return
 
@@ -1093,6 +1094,7 @@ class WebBotAdapter(BotAdapter):
             except UiRetryableException as e:
                 if num_retries >= max_retries:
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is retryable but the number of retries exceeded the limit, so returning")
+                    self.before_giving_up_join(e.step)
                     self.send_debug_screenshot_message(step=e.step, exception=e, inner_exception=e.inner_exception)
                     return
 
@@ -1121,6 +1123,10 @@ class WebBotAdapter(BotAdapter):
 
         self.after_bot_joined_meeting()
         self.subclass_specific_after_bot_joined_meeting()
+
+    def before_giving_up_join(self, step):
+        """Called once, with the browser still in the meeting page, when the join is abandoned."""
+        pass
 
     def after_bot_joined_meeting(self):
         self.send_message_callback({"message": self.Messages.BOT_JOINED_MEETING})
