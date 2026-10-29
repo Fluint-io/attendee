@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Callable
 
 from django.conf import settings
@@ -10,6 +11,27 @@ from bots.google_meet_bot_adapter.google_meet_ui_methods import (
 from bots.web_bot_adapter import WebBotAdapter
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CANNOT_RECORD_CHAT_MESSAGE = "Heads up: I'm not able to record this meeting, so no notes will be captured."
+
+OPEN_CHAT_AND_SEND_SCRIPT = """
+const [text, done] = arguments;
+const findInput = () => document.querySelector('textarea[aria-label="Send a message"]');
+if (!findInput()) {
+    document.querySelector('button[aria-label="Chat with everyone"]')?.click();
+}
+let attempts = 0;
+const poll = () => {
+    if (findInput()) {
+        done(window.sendChatMessage ? window.sendChatMessage(text) : false);
+    } else if (++attempts >= 30) {
+        done(false);
+    } else {
+        setTimeout(poll, 100);
+    }
+};
+poll();
+"""
 
 
 class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
@@ -65,6 +87,18 @@ class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
     def send_video(self, video_url, loop=False, mute_video=False):
         logger.info(f"send_video called with video_url = {video_url}, loop = {loop}, mute_video = {mute_video}")
         self.driver.execute_script(f"window.botOutputManager.playVideo({json.dumps(video_url)}, {json.dumps(loop)}, {json.dumps(mute_video)})")
+
+    def before_giving_up_join(self, step):
+        # The bot is already in the room when the captions button never appears (ENG-480), but the
+        # join is about to be abandoned, so Attendee will never let anyone else post to the chat.
+        if step != "click_captions_button":
+            return
+        text = os.getenv("CANNOT_RECORD_CHAT_MESSAGE") or DEFAULT_CANNOT_RECORD_CHAT_MESSAGE
+        try:
+            sent = self.driver.execute_async_script(OPEN_CHAT_AND_SEND_SCRIPT, text)
+            logger.info(f"Posted cannot-record chat message before giving up the join: sent={sent}")
+        except Exception:
+            logger.exception("Failed to post cannot-record chat message before giving up the join")
 
     def send_chat_message(self, text, to_user_uuid):
         self.driver.execute_script("window?.sendChatMessage(arguments[0]);", text)
