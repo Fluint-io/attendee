@@ -387,6 +387,7 @@ class TestZoomUnansweredRecordingRequest(SimpleTestCase):
         adapter.recording_permission_granted = False
         adapter.recording_request_answered = False
         adapter.unanswered_recording_requests_with_host_present = 0
+        adapter.recording_request_recheck_timeout_id = 7
         adapter.recording_ctrl = MagicMock()
         adapter.participants_ctrl = MagicMock()
         adapter.participants_ctrl.GetParticipantsList.return_value = [1]
@@ -400,6 +401,7 @@ class TestZoomUnansweredRecordingRequest(SimpleTestCase):
         results = [adapter.re_request_recording_privilege_if_unanswered() for _ in range(3)]
 
         self.assertEqual(results, [True, True, False])
+        self.assertIsNone(adapter.recording_request_recheck_timeout_id)
         self.assertEqual(adapter.recording_ctrl.RequestLocalRecordingPrivilege.call_count, 2)
         adapter.send_message_callback.assert_called_once_with({"message": ZoomBotAdapter.Messages.BOT_RECORDING_PERMISSION_DENIED, "denied_reason": BotAdapter.BOT_RECORDING_PERMISSION_DENIED_REASON.REQUEST_TIMED_OUT})
 

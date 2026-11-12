@@ -124,6 +124,7 @@ class ZoomBotAdapter(BotAdapter):
         self.recording_permission_granted = False
         self.recording_request_answered = False
         self.unanswered_recording_requests_with_host_present = 0
+        self.recording_request_recheck_timeout_id = None
         self.raw_recording_active = False
 
         self.reminder_controller = None
@@ -262,10 +263,16 @@ class ZoomBotAdapter(BotAdapter):
             logger.warning(f"Error checking whether the host is in the meeting: {e}")
         return False
 
+    def clear_recording_request_recheck_timeout(self):
+        if self.recording_request_recheck_timeout_id is not None:
+            GLib.source_remove(self.recording_request_recheck_timeout_id)
+            self.recording_request_recheck_timeout_id = None
+
     def re_request_recording_privilege_if_unanswered(self):
         # Seen when IsSupportRequestLocalRecordingPrivilege fails (MODULE_LOAD_FAILED): the request goes
         # nowhere, the host sees no prompt, and the bot records nothing. Give up only once a host could have answered.
         if self.requested_leave or self.cleaned_up or self.recording_permission_granted or self.recording_request_answered:
+            self.recording_request_recheck_timeout_id = None
             return False
 
         if self.host_is_in_meeting():
@@ -273,6 +280,7 @@ class ZoomBotAdapter(BotAdapter):
             if self.unanswered_recording_requests_with_host_present >= self.MAX_UNANSWERED_RECORDING_REQUESTS_WITH_HOST_PRESENT:
                 logger.warning(f"Zoom never answered {self.unanswered_recording_requests_with_host_present} recording privilege requests with the host present. Treating it as timed out.")
                 self.handle_recording_permission_denied(reason=BotAdapter.BOT_RECORDING_PERMISSION_DENIED_REASON.REQUEST_TIMED_OUT)
+                self.recording_request_recheck_timeout_id = None
                 return False
 
         logger.info(f"Re-requesting recording privilege since Zoom has not answered in {self.UNANSWERED_RECORDING_REQUEST_RECHECK_SECONDS} seconds.")
@@ -743,6 +751,8 @@ class ZoomBotAdapter(BotAdapter):
             # If we can then start it
             # If we can't then request it
 
+            # on_join reruns after a waiting room or breakout room, so drop the previous cycle's recheck
+            self.clear_recording_request_recheck_timeout()
             can_start_recording_result = self.recording_ctrl.CanStartRawRecording()
             if can_start_recording_result != zoom.SDKERR_SUCCESS:
                 # Check for various reasons why it might be impossible to get the permission
@@ -752,7 +762,9 @@ class ZoomBotAdapter(BotAdapter):
                 if is_support_request_local_recording_privilege_result == zoom.SDKERR_MEETING_DONT_SUPPORT_FEATURE:
                     self.handle_recording_permission_denied(reason=BotAdapter.BOT_RECORDING_PERMISSION_DENIED_REASON.HOST_CLIENT_CANNOT_GRANT_PERMISSION)
                 else:
-                    GLib.timeout_add_seconds(self.UNANSWERED_RECORDING_REQUEST_RECHECK_SECONDS, self.re_request_recording_privilege_if_unanswered)
+                    self.recording_request_answered = False
+                    self.unanswered_recording_requests_with_host_present = 0
+                    self.recording_request_recheck_timeout_id = GLib.timeout_add_seconds(self.UNANSWERED_RECORDING_REQUEST_RECHECK_SECONDS, self.re_request_recording_privilege_if_unanswered)
 
                 self.recording_ctrl.RequestLocalRecordingPrivilege()
                 logger.info("Requesting recording privilege.")
