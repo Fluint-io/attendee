@@ -1918,14 +1918,23 @@ new FetchInterceptor(async (response) => {
     if (response.url === createMeetingDeviceUrl || response.url === updateMeetingDeviceUrl) {
         if (!response.ok)
             return;
-        const responseText = await response.text();
-        const decodedData = base64ToUint8Array(responseText);
-        const createDeviceResponse = messageDecoders['CreateMeetingDeviceResponse'](decodedData);
-        const detected = Boolean(createDeviceResponse.detectedAsBot);
-        window.ws?.sendJson({
-            type: 'DetectedAsBot',
-            detected,
-        });
+        // Telemetry only: FetchInterceptor rethrows callback errors, which would fail Meet's own join request
+        try {
+            const responseText = await response.text();
+            const decodedData = base64ToUint8Array(responseText);
+            const createDeviceResponse = messageDecoders['CreateMeetingDeviceResponse'](decodedData);
+            const detected = Boolean(createDeviceResponse.detectedAsBot);
+            window.ws?.sendJson({
+                type: 'DetectedAsBot',
+                detected,
+            });
+        } catch (error) {
+            window.ws?.sendJson({
+                type: 'DetectedAsBot',
+                detected: null,
+                error: String(error),
+            });
+        }
     }
 });
 
