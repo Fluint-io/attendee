@@ -57,6 +57,10 @@ def create_black_yuv420_frame(width=640, height=360):
 
 
 class ZoomBotAdapter(BotAdapter):
+    # Zoom answers a delivered request (Granted, Denied, or Timeout after ~30s), so this much silence means it was lost
+    UNANSWERED_RECORDING_REQUEST_RECHECK_SECONDS = 60
+    MAX_UNANSWERED_RECORDING_REQUESTS_WITH_HOST_PRESENT = 3
+
     def __init__(
         self,
         *,
@@ -118,6 +122,8 @@ class ZoomBotAdapter(BotAdapter):
 
         self.use_raw_recording = True
         self.recording_permission_granted = False
+        self.recording_request_answered = False
+        self.unanswered_recording_requests_with_host_present = 0
         self.raw_recording_active = False
 
         self.reminder_controller = None
@@ -245,6 +251,33 @@ class ZoomBotAdapter(BotAdapter):
                 self.recording_ctrl.RequestLocalRecordingPrivilege()
         except Exception as e:
             logger.warning(f"Error retrieving user in request_permission_to_record_if_joined_user_is_host: {e}")
+
+    def host_is_in_meeting(self):
+        try:
+            for participant_id in self.participants_ctrl.GetParticipantsList():
+                user = self.participants_ctrl.GetUserByUserID(participant_id)
+                if user and user.IsHost():
+                    return True
+        except Exception as e:
+            logger.warning(f"Error checking whether the host is in the meeting: {e}")
+        return False
+
+    def re_request_recording_privilege_if_unanswered(self):
+        # Seen when IsSupportRequestLocalRecordingPrivilege fails (MODULE_LOAD_FAILED): the request goes
+        # nowhere, the host sees no prompt, and the bot records nothing. Give up only once a host could have answered.
+        if self.requested_leave or self.cleaned_up or self.recording_permission_granted or self.recording_request_answered:
+            return False
+
+        if self.host_is_in_meeting():
+            self.unanswered_recording_requests_with_host_present += 1
+            if self.unanswered_recording_requests_with_host_present >= self.MAX_UNANSWERED_RECORDING_REQUESTS_WITH_HOST_PRESENT:
+                logger.warning(f"Zoom never answered {self.unanswered_recording_requests_with_host_present} recording privilege requests with the host present. Treating it as timed out.")
+                self.handle_recording_permission_denied(reason=BotAdapter.BOT_RECORDING_PERMISSION_DENIED_REASON.REQUEST_TIMED_OUT)
+                return False
+
+        logger.info(f"Re-requesting recording privilege since Zoom has not answered in {self.UNANSWERED_RECORDING_REQUEST_RECHECK_SECONDS} seconds.")
+        self.recording_ctrl.RequestLocalRecordingPrivilege()
+        return True
 
     def on_user_join_callback(self, joined_user_ids, _):
         logger.info(f"on_user_join_callback called. joined_user_ids = {joined_user_ids}")
@@ -697,6 +730,7 @@ class ZoomBotAdapter(BotAdapter):
 
             def on_local_recording_privilege_request_status_changed(status):
                 logger.info(f"on_local_recording_privilege_request_status called. status = {status}")
+                self.recording_request_answered = True
                 if status == zoom.RequestLocalRecordingStatus.RequestLocalRecording_Denied:
                     self.handle_recording_permission_denied(reason=BotAdapter.BOT_RECORDING_PERMISSION_DENIED_REASON.HOST_DENIED_PERMISSION)
                 if status == zoom.RequestLocalRecordingStatus.RequestLocalRecording_Timeout:
@@ -717,6 +751,8 @@ class ZoomBotAdapter(BotAdapter):
                 # This means the host is using a zoom client that is incapable of displaying the popup to allow recording (Only known client where this happens is Zoom Rooms)
                 if is_support_request_local_recording_privilege_result == zoom.SDKERR_MEETING_DONT_SUPPORT_FEATURE:
                     self.handle_recording_permission_denied(reason=BotAdapter.BOT_RECORDING_PERMISSION_DENIED_REASON.HOST_CLIENT_CANNOT_GRANT_PERMISSION)
+                else:
+                    GLib.timeout_add_seconds(self.UNANSWERED_RECORDING_REQUEST_RECHECK_SECONDS, self.re_request_recording_privilege_if_unanswered)
 
                 self.recording_ctrl.RequestLocalRecordingPrivilege()
                 logger.info("Requesting recording privilege.")

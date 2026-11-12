@@ -379,6 +379,49 @@ class TestZoomParticipantTracking(SimpleTestCase):
 
 
 @tag("zoom_tests")
+class TestZoomUnansweredRecordingRequest(SimpleTestCase):
+    def make_adapter(self, host_present):
+        adapter = ZoomBotAdapter.__new__(ZoomBotAdapter)
+        adapter.requested_leave = False
+        adapter.cleaned_up = False
+        adapter.recording_permission_granted = False
+        adapter.recording_request_answered = False
+        adapter.unanswered_recording_requests_with_host_present = 0
+        adapter.recording_ctrl = MagicMock()
+        adapter.participants_ctrl = MagicMock()
+        adapter.participants_ctrl.GetParticipantsList.return_value = [1]
+        adapter.participants_ctrl.GetUserByUserID.return_value.IsHost.return_value = host_present
+        adapter.send_message_callback = MagicMock()
+        return adapter
+
+    def test_gives_up_as_timed_out_when_host_present_and_zoom_stays_silent(self):
+        adapter = self.make_adapter(host_present=True)
+
+        results = [adapter.re_request_recording_privilege_if_unanswered() for _ in range(3)]
+
+        self.assertEqual(results, [True, True, False])
+        self.assertEqual(adapter.recording_ctrl.RequestLocalRecordingPrivilege.call_count, 2)
+        adapter.send_message_callback.assert_called_once_with({"message": ZoomBotAdapter.Messages.BOT_RECORDING_PERMISSION_DENIED, "denied_reason": BotAdapter.BOT_RECORDING_PERMISSION_DENIED_REASON.REQUEST_TIMED_OUT})
+
+    def test_keeps_asking_without_giving_up_while_host_is_absent(self):
+        adapter = self.make_adapter(host_present=False)
+
+        results = [adapter.re_request_recording_privilege_if_unanswered() for _ in range(5)]
+
+        self.assertEqual(results, [True] * 5)
+        self.assertEqual(adapter.recording_ctrl.RequestLocalRecordingPrivilege.call_count, 5)
+        adapter.send_message_callback.assert_not_called()
+
+    def test_stops_once_zoom_answers(self):
+        adapter = self.make_adapter(host_present=True)
+        adapter.recording_request_answered = True
+
+        self.assertFalse(adapter.re_request_recording_privilege_if_unanswered())
+        adapter.recording_ctrl.RequestLocalRecordingPrivilege.assert_not_called()
+        adapter.send_message_callback.assert_not_called()
+
+
+@tag("zoom_tests")
 class TestZoomBot(TransactionTestCase):
     @classmethod
     def setUpClass(cls):
