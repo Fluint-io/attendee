@@ -414,6 +414,31 @@ class TestZoomUnansweredRecordingRequest(SimpleTestCase):
         self.assertEqual(adapter.recording_ctrl.RequestLocalRecordingPrivilege.call_count, 5)
         adapter.send_message_callback.assert_not_called()
 
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.GLib")
+    def test_host_joining_restarts_a_stale_cycle(self, mock_glib):
+        adapter = self.make_adapter(host_present=True)
+        adapter.awaiting_panelist_promotion = False
+        adapter.recording_request_answered = True
+        adapter.unanswered_recording_requests_with_host_present = 2
+
+        adapter.request_permission_to_record_if_joined_user_is_host(1)
+
+        mock_glib.source_remove.assert_called_once_with(7)
+        mock_glib.timeout_add_seconds.assert_called_once_with(ZoomBotAdapter.UNANSWERED_RECORDING_REQUEST_RECHECK_SECONDS, adapter.re_request_recording_privilege_if_unanswered)
+        self.assertFalse(adapter.recording_request_answered)
+        self.assertEqual(adapter.unanswered_recording_requests_with_host_present, 0)
+        adapter.recording_ctrl.RequestLocalRecordingPrivilege.assert_called_once()
+
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.GLib")
+    def test_no_recheck_while_webinar_attendee_awaits_promotion(self, mock_glib):
+        adapter = self.make_adapter(host_present=True)
+        adapter.awaiting_panelist_promotion = True
+
+        adapter.request_permission_to_record_if_joined_user_is_host(1)
+
+        mock_glib.timeout_add_seconds.assert_not_called()
+        adapter.recording_ctrl.RequestLocalRecordingPrivilege.assert_called_once()
+
     def test_stops_once_zoom_answers(self):
         adapter = self.make_adapter(host_present=True)
         adapter.recording_request_answered = True

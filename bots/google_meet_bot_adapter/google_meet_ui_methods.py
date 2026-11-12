@@ -135,10 +135,15 @@ class GoogleMeetUIMethods:
             return
 
         logger.info("Clicking continue_as_guest_button")
-        if self.ui_interaction_mode == "humanized":
-            self.humanized_navigate_to_and_click_element(continue_as_guest_button)
-        else:
-            self.click_element_with_fallback_to_forceful_click(continue_as_guest_button, step)
+        # Runs inside fill_out_name_input's TimeoutException handler, so an escaping error would cost a whole join attempt
+        try:
+            if self.ui_interaction_mode == "humanized":
+                self.humanized_navigate_to_and_click_element(continue_as_guest_button)
+            else:
+                self.click_element_with_fallback_to_forceful_click(continue_as_guest_button, step)
+        except Exception as e:
+            logger.warning(f"Could not click continue_as_guest_button, will retry: {type(e).__name__}: {e}")
+            return
         self.continue_as_guest_button_last_clicked_at = time.time()
 
     def look_for_blocked_element(self, step):
