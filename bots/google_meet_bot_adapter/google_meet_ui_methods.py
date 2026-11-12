@@ -121,6 +121,31 @@ class GoogleMeetUIMethods:
             logger.info("Clicking others_may_see_your_meeting_differently_button")
             self.click_element_forcefully(others_may_see_your_meeting_differently_button, step)
 
+    # Some meetings show a "Continue as guest" / "Sign in with Google" screen before the name input
+    def look_for_continue_as_guest_button(self, step):
+        continue_as_guest_button = self.find_element_by_selector(By.XPATH, '//button[contains(., "Continue as guest")] | //div[@role="button"][contains(., "Continue as guest")]')
+        if not continue_as_guest_button:
+            return
+
+        if not hasattr(self, "continue_as_guest_button_last_clicked_at"):
+            self.continue_as_guest_button_last_clicked_at = None
+
+        # The page takes a moment to transition after clicking, so don't click again while that's happening
+        if self.continue_as_guest_button_last_clicked_at and time.time() - self.continue_as_guest_button_last_clicked_at < 10:
+            return
+
+        logger.info("Clicking continue_as_guest_button")
+        # Runs inside fill_out_name_input's TimeoutException handler, so an escaping error would cost a whole join attempt
+        try:
+            if self.ui_interaction_mode == "humanized":
+                self.humanized_navigate_to_and_click_element(continue_as_guest_button)
+            else:
+                self.click_element_with_fallback_to_forceful_click(continue_as_guest_button, step)
+        except Exception as e:
+            logger.warning(f"Could not click continue_as_guest_button, will retry: {type(e).__name__}: {e}")
+            return
+        self.continue_as_guest_button_last_clicked_at = time.time()
+
     def look_for_blocked_element(self, step):
         cannot_join_element = self.find_element_by_selector(By.XPATH, '//*[contains(text(), "You can\'t join this video call") or contains(text(), "There is a problem connecting to this video call")]')
         if cannot_join_element:
@@ -278,7 +303,7 @@ class GoogleMeetUIMethods:
         return False
 
     def retrieve_name_input_element(self):
-        return WebDriverWait(self.driver, 1).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="text"][aria-label="Your name"]')))
+        return WebDriverWait(self.driver, 1).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="text"][aria-label="Your name"], input[type="text"][aria-label="Enter your name"]')))
 
     UNSHIFTED_PUNCTUATION = {
         "-": "minus",
@@ -374,10 +399,7 @@ class GoogleMeetUIMethods:
         if not hasattr(self, "mocap_manager"):
             self.mocap_manager = MocapManager(video_frame_size=self.video_frame_size)
 
-    def humanized_navigate_to_and_click_element(self, element):
-        self.ensure_x11_input()
-        self.ensure_mocap_manager()
-
+    def _measure_clickable_rect(self, element):
         metrics = self.driver.execute_script(
             """
             const el = arguments[0];
@@ -422,15 +444,23 @@ class GoogleMeetUIMethods:
         rect_right = int(round((screen_x + clickable_css_right) * dpr))
         rect_bottom = int(round((screen_y + clickable_css_bottom) * dpr))
 
+        return rect_left, rect_top, rect_right, rect_bottom, screen_x, screen_y, dpr
+
+    def humanized_navigate_to_and_click_element(self, element):
+        self.ensure_x11_input()
+        self.ensure_mocap_manager()
+
         ptr = self.x11_input.root.query_pointer()._data
         current_x = int(ptr["root_x"])
         current_y = int(ptr["root_y"])
 
-        logger.info(f"humanized interaction: mouse at ({current_x},{current_y}), clickable rect [({rect_left},{rect_top})-({rect_right},{rect_bottom})]")
-
         seq = None
         num_seq_attempts = 10
         for attempt in range(num_seq_attempts):
+            # The element can move between attempts (e.g. while the page is still transitioning), so re-measure it each time
+            rect_left, rect_top, rect_right, rect_bottom, screen_x, screen_y, dpr = self._measure_clickable_rect(element)
+            logger.info(f"humanized interaction: mouse at ({current_x},{current_y}), clickable rect [({rect_left},{rect_top})-({rect_right},{rect_bottom})]")
+
             seq = self.mocap_manager.find_random_sequence_landing_in_rect(current_x, current_y, rect_left, rect_top, rect_right, rect_bottom)
 
             # If we have hit dead ends 2 times in the past, we will stretch the mocap path to fit the desired endpoint
@@ -464,6 +494,7 @@ class GoogleMeetUIMethods:
 
             logger.info(f"humanized interaction: endpoint page coords ({endpoint_page_x:.1f}, {endpoint_page_y:.1f}) not on target element, retrying (attempt {attempt + 1}/{num_seq_attempts})")
         else:
+            self.send_screenshot_and_mhtml_file_message()
             raise RuntimeError(f"Could not find mocap sequence landing on target element after {num_seq_attempts} attempts")
 
         logger.info(f"humanized interaction: selected sequence with {len(seq.movements)} movements, total_dx={seq.total_dx}, total_dy={seq.total_dy}")
@@ -504,6 +535,7 @@ class GoogleMeetUIMethods:
             except TimeoutException as e:
                 self.look_for_blocked_element("name_input")
                 self.look_for_login_required_element("name_input")
+                self.look_for_continue_as_guest_button("name_input")
                 self.check_if_meeting_is_found()
 
                 if self.google_meet_bot_login_session and self.join_now_button_is_present():

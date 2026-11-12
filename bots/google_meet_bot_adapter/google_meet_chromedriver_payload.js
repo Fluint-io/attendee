@@ -1673,6 +1673,12 @@ const messageTypes = [
             { name: 'disabled', fieldNumber: 1, type: 'varint' }
         ]
     },
+    {
+        name: 'CreateMeetingDeviceResponse',
+        fields: [
+            { name: 'detectedAsBot', fieldNumber: 36, type: 'varint' }
+        ]
+    },
     // Existing message types
     {
         name: 'UserInfoListResponse',
@@ -1894,6 +1900,8 @@ function base64ToUint8Array(base64) {
 }
 
 const syncMeetingSpaceCollectionsUrl = "https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingSpaceService/SyncMeetingSpaceCollections";
+const createMeetingDeviceUrl = "https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingDeviceService/CreateMeetingDevice";
+const updateMeetingDeviceUrl = "https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingDeviceService/UpdateMeetingDevice";
 const userMap = new Map();
 new FetchInterceptor(async (response) => {
     if (response.url === syncMeetingSpaceCollectionsUrl) {
@@ -1904,6 +1912,28 @@ new FetchInterceptor(async (response) => {
         console.log('userInfoList', userInfoList);
         if (userInfoList.length > 0) {
             userManager.newUsersListSynced(userInfoList);
+        }
+    }
+    // Both create and update meeting device requests return the same response type
+    if (response.url === createMeetingDeviceUrl || response.url === updateMeetingDeviceUrl) {
+        if (!response.ok)
+            return;
+        // Telemetry only: FetchInterceptor rethrows callback errors, which would fail Meet's own join request
+        try {
+            const responseText = await response.text();
+            const decodedData = base64ToUint8Array(responseText);
+            const createDeviceResponse = messageDecoders['CreateMeetingDeviceResponse'](decodedData);
+            const detected = Boolean(createDeviceResponse.detectedAsBot);
+            window.ws?.sendJson({
+                type: 'DetectedAsBot',
+                detected,
+            });
+        } catch (error) {
+            window.ws?.sendJson({
+                type: 'DetectedAsBot',
+                detected: null,
+                error: String(error),
+            });
         }
     }
 });
