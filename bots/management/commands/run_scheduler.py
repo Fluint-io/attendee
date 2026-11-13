@@ -10,7 +10,7 @@ import redis
 from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import connection, models, transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from accounts.models import Organization
@@ -26,6 +26,7 @@ from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_c
 log = logging.getLogger(__name__)
 
 CALENDAR_SYNC_THRESHOLD_HOURS = 24  # The longest a calendar can go without having been synced
+CALENDAR_SYNC_IN_FLIGHT_TIMEOUT_MINUTES = 30  # After this long, an unfinished sync no longer blocks a new one
 
 # Heartbeat file the scheduler rewrites each cycle so a liveness probe can
 # restart the pod if the loop stalls (a process-liveness check wouldn't catch it).
@@ -130,6 +131,10 @@ class Command(BaseCommand):
         calendars = Calendar.objects.filter(
             state=CalendarStates.CONNECTED,
         ).filter(Q(sync_task_enqueued_at__isnull=True) | Q(sync_task_enqueued_at__lte=cutoff_time) | Q(sync_task_requested_at__isnull=False))
+
+        # Skip calendars whose last sync is still queued or retrying. Their sync_task_requested_at stays set, so they're synced once it finishes.
+        in_flight_cutoff = now - timezone.timedelta(minutes=CALENDAR_SYNC_IN_FLIGHT_TIMEOUT_MINUTES)
+        calendars = calendars.filter(Q(sync_task_enqueued_at__isnull=True) | Q(sync_task_enqueued_at__lte=in_flight_cutoff) | Q(last_attempted_sync_at__gte=F("sync_task_enqueued_at")))
 
         for calendar in calendars:
             last_enqueued = calendar.sync_task_enqueued_at.isoformat() if calendar.sync_task_enqueued_at else "never"

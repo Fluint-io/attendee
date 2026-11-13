@@ -9,7 +9,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone as django_timezone
 
 from accounts.models import Organization
-from bots.management.commands.run_scheduler import CALENDAR_SYNC_THRESHOLD_HOURS, Command
+from bots.management.commands.run_scheduler import CALENDAR_SYNC_IN_FLIGHT_TIMEOUT_MINUTES, CALENDAR_SYNC_THRESHOLD_HOURS, Command
 from bots.models import Bot, BotStates, Calendar, CalendarPlatform, CalendarStates, Project, ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
 
 
@@ -215,7 +215,7 @@ class RunSchedulerCommandTestCase(TestCase):
         # Calendar synced recently, but with a requested sync (should be included)
         exactly_five_minutes_ago = self.now - django_timezone.timedelta(minutes=5)
         exactly_24_hours_ago = self.now - django_timezone.timedelta(hours=24)
-        calendar_with_requested_sync = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, state=CalendarStates.CONNECTED, sync_task_enqueued_at=exactly_five_minutes_ago, sync_task_requested_at=exactly_24_hours_ago, client_id="test_client_id_boundary")
+        calendar_with_requested_sync = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, state=CalendarStates.CONNECTED, sync_task_enqueued_at=exactly_five_minutes_ago, last_attempted_sync_at=exactly_five_minutes_ago, sync_task_requested_at=exactly_24_hours_ago, client_id="test_client_id_boundary")
 
         command = Command()
 
@@ -230,6 +230,59 @@ class RunSchedulerCommandTestCase(TestCase):
         calendar_with_requested_sync.refresh_from_db()
         self.assertEqual(calendar_with_requested_sync.sync_task_enqueued_at, self.now)
         self.assertEqual(calendar_with_requested_sync.sync_task_requested_at, None)
+
+    def test_run_periodic_calendar_syncs_skips_in_flight_syncs(self):
+        """Test that a calendar whose sync is still queued or retrying gets no second sync and keeps its request"""
+        enqueued_at = self.now - django_timezone.timedelta(minutes=10)
+        requested_at = self.now - django_timezone.timedelta(minutes=1)
+        never_attempted = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, state=CalendarStates.CONNECTED, sync_task_enqueued_at=enqueued_at, sync_task_requested_at=requested_at, client_id="test_client_id_never")
+        attempted_before_enqueue = Calendar.objects.create(project=self.project, platform=CalendarPlatform.MICROSOFT, state=CalendarStates.CONNECTED, sync_task_enqueued_at=enqueued_at, last_attempted_sync_at=enqueued_at - django_timezone.timedelta(hours=1), sync_task_requested_at=requested_at, client_id="test_client_id_before")
+
+        command = Command()
+
+        with patch("bots.tasks.sync_calendar_task.sync_calendar.delay") as mock_delay:
+            with patch("django.utils.timezone.now", return_value=self.now):
+                command._run_periodic_calendar_syncs()
+
+            mock_delay.assert_not_called()
+
+        for calendar in (never_attempted, attempted_before_enqueue):
+            calendar.refresh_from_db()
+            self.assertEqual(calendar.sync_task_enqueued_at, enqueued_at)
+            self.assertEqual(calendar.sync_task_requested_at, requested_at)
+
+    def test_run_periodic_calendar_syncs_enqueues_after_attempt(self):
+        """Test that a requested sync is enqueued once the previous sync has been attempted"""
+        enqueued_at = self.now - django_timezone.timedelta(minutes=10)
+        calendar = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, state=CalendarStates.CONNECTED, sync_task_enqueued_at=enqueued_at, last_attempted_sync_at=enqueued_at + django_timezone.timedelta(minutes=2), sync_task_requested_at=self.now, client_id="test_client_id")
+
+        command = Command()
+
+        with patch("bots.tasks.sync_calendar_task.sync_calendar.delay") as mock_delay:
+            with patch("django.utils.timezone.now", return_value=self.now):
+                command._run_periodic_calendar_syncs()
+
+            mock_delay.assert_called_once_with(calendar.id)
+
+        calendar.refresh_from_db()
+        self.assertEqual(calendar.sync_task_enqueued_at, self.now)
+        self.assertIsNone(calendar.sync_task_requested_at)
+
+    def test_run_periodic_calendar_syncs_in_flight_timeout(self):
+        """Test that a sync that never finishes stops blocking its calendar after the in-flight timeout"""
+        at_timeout = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, state=CalendarStates.CONNECTED, sync_task_enqueued_at=self.now - django_timezone.timedelta(minutes=CALENDAR_SYNC_IN_FLIGHT_TIMEOUT_MINUTES), sync_task_requested_at=self.now, client_id="test_client_id_at")
+        just_under_timeout = Calendar.objects.create(project=self.project, platform=CalendarPlatform.MICROSOFT, state=CalendarStates.CONNECTED, sync_task_enqueued_at=self.now - django_timezone.timedelta(minutes=CALENDAR_SYNC_IN_FLIGHT_TIMEOUT_MINUTES - 1), sync_task_requested_at=self.now, client_id="test_client_id_under")
+
+        command = Command()
+
+        with patch("bots.tasks.sync_calendar_task.sync_calendar.delay") as mock_delay:
+            with patch("django.utils.timezone.now", return_value=self.now):
+                command._run_periodic_calendar_syncs()
+
+            mock_delay.assert_called_once_with(at_timeout.id)
+
+        just_under_timeout.refresh_from_db()
+        self.assertEqual(just_under_timeout.sync_task_requested_at, self.now)
 
     def test_run_autopay_tasks_enqueues_eligible_organizations(self):
         """Test that _run_autopay_tasks finds and enqueues autopay tasks for eligible organizations"""

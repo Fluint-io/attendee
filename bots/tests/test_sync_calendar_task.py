@@ -301,6 +301,15 @@ class TestSyncCalendar(TestCase):
         mock_handler.sync_events.assert_called_once()
         self.assertEqual(result, {"success": True})
 
+    @patch("bots.tasks.sync_calendar_task.GoogleCalendarSyncHandler")
+    def test_sync_calendar_first_attempt_is_not_final(self, mock_handler_class):
+        """Test sync_calendar tells the handler a first attempt is not the final one."""
+        calendar = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, client_id="test_client_id")
+
+        sync_calendar(calendar.id)
+
+        mock_handler_class.return_value.sync_events.assert_called_once_with(is_final_attempt=False)
+
     def test_sync_calendar_unsupported_platform(self):
         """Test sync_calendar task raises error for unsupported platform."""
         calendar = Calendar.objects.create(project=self.project, platform="unsupported", client_id="test_client_id")
@@ -535,6 +544,23 @@ class TestCalendarSyncHandlerSyncEvents(TransactionTestCase):
             handler.sync_events()
 
         # Verify calendar last_attempted_sync_at is updated
+        self.calendar.refresh_from_db()
+        self.assertIsNotNone(self.calendar.last_attempted_sync_at)
+
+    def test_sync_events_general_exception_only_stamps_final_attempt(self):
+        """Test that a failed attempt that will be retried leaves last_attempted_sync_at unset"""
+        handler = CalendarSyncHandler(self.calendar.id)
+        handler._get_access_token = Mock(side_effect=Exception("General error"))
+
+        with self.assertRaises(Exception):
+            handler.sync_events(is_final_attempt=False)
+
+        self.calendar.refresh_from_db()
+        self.assertIsNone(self.calendar.last_attempted_sync_at)
+
+        with self.assertRaises(Exception):
+            handler.sync_events(is_final_attempt=True)
+
         self.calendar.refresh_from_db()
         self.assertIsNotNone(self.calendar.last_attempted_sync_at)
 

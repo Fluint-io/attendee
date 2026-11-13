@@ -113,7 +113,7 @@ def sync_calendar(self, calendar_id):
         sync_handler = MicrosoftCalendarSyncHandler(calendar_id)
     else:
         raise ValueError(f"Unsupported calendar platform: {calendar.platform}")
-    return sync_handler.sync_events()
+    return sync_handler.sync_events(is_final_attempt=self.request.retries >= self.max_retries)
 
 
 class CalendarAPIError(Exception):
@@ -184,7 +184,7 @@ class CalendarSyncHandler:
         # Sync the bots for the calendar event
         sync_bots_for_calendar_event(local_event)
 
-    def sync_events(self) -> dict:
+    def sync_events(self, is_final_attempt: bool = True) -> dict:
         """
         Main sync method that coordinates the entire sync process.
 
@@ -314,8 +314,10 @@ class CalendarSyncHandler:
 
         except Exception as e:
             logger.exception(f"Calendar sync failed with {type(e).__name__} for {self.calendar.object_id}: {e}")
-            self.calendar.last_attempted_sync_at = timezone.now()
-            self.calendar.save()
+            # Stamping before the last retry would let the scheduler enqueue a second sync while this one is still retrying.
+            if is_final_attempt:
+                self.calendar.last_attempted_sync_at = timezone.now()
+                self.calendar.save()
             raise
 
 
@@ -389,7 +391,10 @@ class GoogleCalendarSyncHandler(CalendarSyncHandler):
         # Timeout and ConnectionError carry no response
         if e.response is None:
             return
-        error_code = e.response.json().get("error")
+        try:
+            error_code = e.response.json().get("error")
+        except ValueError:
+            error_code = None
         if error_code == "invalid_grant" or error_code == "invalid_client" or error_code == "deleted_client":
             raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.json()}")
         if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in e.response.text:
@@ -663,7 +668,11 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
         # Timeout and ConnectionError carry no response
         if e.response is None:
             return
-        if e.response.json().get("error") == "invalid_grant" or e.response.json().get("error") == "invalid_client":
+        try:
+            error_code = e.response.json().get("error")
+        except ValueError:
+            error_code = None
+        if error_code == "invalid_grant" or error_code == "invalid_client":
             raise CalendarAPIAuthenticationError(f"Microsoft Authentication error: {e.response.json()}")
 
         authentication_error_substrings = [
