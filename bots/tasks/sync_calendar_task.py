@@ -392,9 +392,10 @@ class GoogleCalendarSyncHandler(CalendarSyncHandler):
         if e.response is None:
             return
         try:
-            error_code = e.response.json().get("error")
+            body = e.response.json()
         except ValueError:
-            error_code = None
+            body = None
+        error_code = body.get("error") if isinstance(body, dict) else None
         if error_code == "invalid_grant" or error_code == "invalid_client" or error_code == "deleted_client":
             raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.json()}")
         if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in e.response.text:
@@ -669,9 +670,10 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
         if e.response is None:
             return
         try:
-            error_code = e.response.json().get("error")
+            body = e.response.json()
         except ValueError:
-            error_code = None
+            body = None
+        error_code = body.get("error") if isinstance(body, dict) else None
         if error_code == "invalid_grant" or error_code == "invalid_client":
             raise CalendarAPIAuthenticationError(f"Microsoft Authentication error: {e.response.json()}")
 

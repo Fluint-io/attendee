@@ -211,7 +211,7 @@ For webhooks triggered by `calendar.events_update`, the `data` field contains ca
   "state": <The current state of the calendar connection ("connected" or "disconnected")>,
   "connection_failure_data": <Any error data if the calendar is disconnected, null if connected>,
   "last_successful_sync_at": <The timestamp of the last successful calendar sync>,
-  "last_attempted_sync_at": <The timestamp of the last sync attempt>,
+  "last_attempted_sync_at": <The timestamp of the last sync attempt that finished (succeeded or exhausted its retries)>,
 }
 ```
 
@@ -226,7 +226,7 @@ For webhooks triggered by `calendar.state_change`, the `data` field contains the
   "state": <The current state of the calendar connection ("connected" or "disconnected")>,
   "connection_failure_data": <Error details when the calendar becomes disconnected>,
   "last_successful_sync_at": <The timestamp of the last successful calendar sync>,
-  "last_attempted_sync_at": <The timestamp of the last sync attempt>,
+  "last_attempted_sync_at": <The timestamp of the last sync attempt that finished (succeeded or exhausted its retries)>,
 }
 ```
 

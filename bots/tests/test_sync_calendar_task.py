@@ -310,6 +310,15 @@ class TestSyncCalendar(TestCase):
 
         mock_handler_class.return_value.sync_events.assert_called_once_with(is_final_attempt=False)
 
+    @patch("bots.tasks.sync_calendar_task.GoogleCalendarSyncHandler")
+    def test_sync_calendar_last_retry_is_final(self, mock_handler_class):
+        """Test sync_calendar tells the handler the last retry is the final attempt."""
+        calendar = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, client_id="test_client_id")
+
+        sync_calendar.apply(args=[calendar.id], retries=sync_calendar.max_retries, throw=True)
+
+        mock_handler_class.return_value.sync_events.assert_called_once_with(is_final_attempt=True)
+
     def test_sync_calendar_unsupported_platform(self):
         """Test sync_calendar task raises error for unsupported platform."""
         calendar = Calendar.objects.create(project=self.project, platform="unsupported", client_id="test_client_id")
@@ -743,6 +752,25 @@ class TestGoogleCalendarSyncHandler(TestCase):
         with self.assertRaises(requests.Timeout):
             handler._list_events("mock_token")
 
+    @patch("requests.Session")
+    def test_make_gcal_request_html_error_body_raises_http_error(self, mock_session_class):
+        """Test that a non-JSON (HTML 502) error body doesn't mask the HTTPError."""
+        handler = GoogleCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
+
+        response = requests.Response()
+        response.status_code = 502
+        response._content = b"<html><body>502 Bad Gateway</body></html>"
+        response.headers["content-type"] = "text/html"
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.HTTPError("502 Server Error: Bad Gateway", response=response)
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.HTTPError):
+            handler._list_events("mock_token")
+
 
 class TestMicrosoftCalendarSyncHandler(TestCase):
     """Test the MicrosoftCalendarSyncHandler class."""
@@ -926,6 +954,25 @@ class TestMicrosoftCalendarSyncHandler(TestCase):
         mock_session_class.return_value.__enter__.return_value = mock_session
 
         with self.assertRaises(requests.Timeout):
+            handler._list_events("mock_token")
+
+    @patch("requests.Session")
+    def test_make_graph_request_html_error_body_raises_http_error(self, mock_session_class):
+        """Test that a non-JSON (HTML 502) error body doesn't mask the HTTPError."""
+        handler = MicrosoftCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
+
+        response = requests.Response()
+        response.status_code = 502
+        response._content = b"<html><body>502 Bad Gateway</body></html>"
+        response.headers["content-type"] = "text/html"
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.HTTPError("502 Server Error: Bad Gateway", response=response)
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.HTTPError):
             handler._list_events("mock_token")
 
 
