@@ -733,6 +733,8 @@ class TestGoogleCalendarSyncHandler(TestCase):
     def test_make_gcal_request_timeout_raises_timeout(self, mock_session_class):
         """Test that a timeout (no response) is raised as-is."""
         handler = GoogleCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
 
         mock_session = Mock()
         mock_session.send.side_effect = requests.Timeout("Read timed out")
