@@ -259,7 +259,7 @@ class CalendarSyncHandler:
                 self.calendar.last_successful_sync_started_at = sync_started_at
                 self.calendar.state = CalendarStates.CONNECTED
                 self.calendar.connection_failure_data = None
-                self.calendar.save()
+                self.calendar.save(update_fields=["last_attempted_sync_at", "last_successful_sync_at", "last_successful_sync_time_window_start", "last_successful_sync_time_window_end", "last_successful_sync_started_at", "state", "connection_failure_data", "updated_at", "version"])
 
                 sync_results = {
                     "success": True,
@@ -296,7 +296,7 @@ class CalendarSyncHandler:
                     "error": str(e),
                     "timestamp": timezone.now().isoformat(),
                 }
-                self.calendar.save()
+                self.calendar.save(update_fields=["state", "connection_failure_data", "updated_at", "version"])
 
                 # Delete any notification channels for the calendar so that when the user re-connects, they will be recreated.
                 # For Google Cal, they seem to keep working even after the authorization is lost, but let's not
@@ -317,7 +317,7 @@ class CalendarSyncHandler:
             # Stamping before the last retry would let the scheduler enqueue a second sync while this one is still retrying.
             if is_final_attempt:
                 self.calendar.last_attempted_sync_at = timezone.now()
-                self.calendar.save()
+                self.calendar.save(update_fields=["last_attempted_sync_at", "updated_at", "version"])
             raise
 
 

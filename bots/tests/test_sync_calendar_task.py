@@ -558,6 +558,24 @@ class TestCalendarSyncHandlerSyncEvents(TransactionTestCase):
         self.assertIsNotNone(self.calendar.last_attempted_sync_at)
 
     @patch("bots.tasks.sync_calendar_task.trigger_webhook")
+    def test_successful_sync_keeps_request_stamped_after_load(self, mock_trigger_webhook):
+        """Test that a successful sync only writes its own fields and keeps a request stamped after the handler loaded the calendar."""
+        handler = CalendarSyncHandler(self.calendar.id)
+        requested_at = timezone.now()
+        Calendar.objects.filter(id=self.calendar.id).update(sync_task_requested_at=requested_at)
+
+        handler._get_access_token = Mock(return_value="mock_token")
+        handler._list_events = Mock(return_value=[])
+        handler._refresh_notification_channels = Mock()
+
+        result = handler.sync_events()
+
+        self.assertTrue(result["success"])
+        self.calendar.refresh_from_db()
+        self.assertEqual(self.calendar.sync_task_requested_at, requested_at)
+        self.assertIsNotNone(self.calendar.last_successful_sync_at)
+
+    @patch("bots.tasks.sync_calendar_task.trigger_webhook")
     def test_sync_request_made_during_sync_survives(self, mock_trigger_webhook):
         """Test that a webhook's sync request stamped mid-sync is not overwritten by the sync's own save."""
         handler = CalendarSyncHandler(self.calendar.id)
