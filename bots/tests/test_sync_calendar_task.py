@@ -3,6 +3,7 @@ from datetime import timezone as python_timezone
 from unittest.mock import Mock, patch
 
 import requests
+from concurrency.exceptions import RecordModifiedError
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -555,6 +556,30 @@ class TestCalendarSyncHandlerSyncEvents(TransactionTestCase):
         # Verify calendar last_attempted_sync_at is updated
         self.calendar.refresh_from_db()
         self.assertIsNotNone(self.calendar.last_attempted_sync_at)
+
+    @patch("bots.tasks.sync_calendar_task.trigger_webhook")
+    def test_sync_request_made_during_sync_survives(self, mock_trigger_webhook):
+        """Test that a webhook's sync request stamped mid-sync is not overwritten by the sync's own save."""
+        handler = CalendarSyncHandler(self.calendar.id)
+        requested_at = timezone.now()
+
+        def list_events_and_request_sync(*args, **kwargs):
+            # Same write as the external webhook views
+            calendar = Calendar.objects.get(id=self.calendar.id)
+            calendar.sync_task_requested_at = requested_at
+            calendar.save()
+            return []
+
+        handler._get_access_token = Mock(return_value="mock_token")
+        handler._list_events = Mock(side_effect=list_events_and_request_sync)
+        handler._refresh_notification_channels = Mock()
+
+        # The calendar's version field rejects the sync's stale save, so the attempt fails and retries
+        with self.assertRaises(RecordModifiedError):
+            handler.sync_events(is_final_attempt=False)
+
+        self.calendar.refresh_from_db()
+        self.assertEqual(self.calendar.sync_task_requested_at, requested_at)
 
     def test_sync_events_general_exception_only_stamps_final_attempt(self):
         """Test that a failed attempt that will be retried leaves last_attempted_sync_at unset"""

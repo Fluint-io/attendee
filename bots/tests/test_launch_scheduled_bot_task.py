@@ -101,6 +101,28 @@ class LaunchScheduledBotTaskTestCase(TestCase):
             self.assertEqual(self.bot.state, BotStates.STAGED)
             mock_launch_bot.assert_called_once_with(self.bot)
 
+    @override_settings(SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS=300)
+    def test_stale_bot_rescheduled_before_lock_is_not_ended(self):
+        """Test that a stale bot whose join_at moves forward before the locked recheck is left SCHEDULED"""
+        stale_join_at = django_timezone.now() - django_timezone.timedelta(seconds=301)
+        new_join_at = django_timezone.now() + django_timezone.timedelta(hours=1)
+        self.bot.join_at = stale_join_at
+        self.bot.save()
+
+        def mock_get_bot_and_move_join_at(id, *args, **kwargs):
+            bot = Bot.objects.filter(id=id).first()
+            Bot.objects.filter(id=id).update(join_at=new_join_at)
+            return bot
+
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot:
+            with patch("bots.models.Bot.objects.get", side_effect=mock_get_bot_and_move_join_at):
+                launch_scheduled_bot(self.bot.id, stale_join_at.isoformat())
+
+            self.bot.refresh_from_db()
+            self.assertEqual(self.bot.state, BotStates.SCHEDULED)
+            self.assertEqual(self.bot.join_at, new_join_at)
+            mock_launch_bot.assert_not_called()
+
     def test_join_at_modified_after_task_queued(self):
         """Test the race condition where join_at is modified between task queueing and execution"""
 

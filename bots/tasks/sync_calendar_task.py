@@ -397,11 +397,11 @@ class GoogleCalendarSyncHandler(CalendarSyncHandler):
             body = None
         error_code = body.get("error") if isinstance(body, dict) else None
         if error_code == "invalid_grant" or error_code == "invalid_client" or error_code == "deleted_client":
-            raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.json()}")
+            raise CalendarAPIAuthenticationError(f"Google Authentication error: {body}")
         if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in e.response.text:
-            raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.json()}")
+            raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.text}")
         if "PERMISSION_DENIED" in e.response.text:
-            raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.json()}")
+            raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.text}")
 
         return
 
@@ -675,7 +675,7 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
             body = None
         error_code = body.get("error") if isinstance(body, dict) else None
         if error_code == "invalid_grant" or error_code == "invalid_client":
-            raise CalendarAPIAuthenticationError(f"Microsoft Authentication error: {e.response.json()}")
+            raise CalendarAPIAuthenticationError(f"Microsoft Authentication error: {body}")
 
         authentication_error_substrings = [
             "ErrorAccessDenied",
@@ -686,7 +686,7 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
 
         for substring in authentication_error_substrings:
             if substring in e.response.text:
-                raise CalendarAPIAuthenticationError(f"Microsoft Authentication error: {e.response.json()}")
+                raise CalendarAPIAuthenticationError(f"Microsoft Authentication error: {e.response.text}")
         return
 
     # ---------------------------
