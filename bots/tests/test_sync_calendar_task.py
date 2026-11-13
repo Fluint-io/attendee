@@ -703,6 +703,18 @@ class TestGoogleCalendarSyncHandler(TestCase):
 
         self.assertIsNone(result)
 
+    @patch("requests.Session")
+    def test_make_gcal_request_timeout_raises_timeout(self, mock_session_class):
+        """Test that a timeout (no response) is raised as-is."""
+        handler = GoogleCalendarSyncHandler(self.calendar.id)
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.Timeout("Read timed out")
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.Timeout):
+            handler._list_events("mock_token")
+
 
 class TestMicrosoftCalendarSyncHandler(TestCase):
     """Test the MicrosoftCalendarSyncHandler class."""
@@ -873,6 +885,20 @@ class TestMicrosoftCalendarSyncHandler(TestCase):
         self.assertEqual(result[0]["id"], "event_1")
         self.assertEqual(result[2]["id"], "event_3")
         self.assertEqual(mock_session.send.call_count, 2)
+
+    @patch("requests.Session")
+    def test_make_graph_request_timeout_raises_timeout(self, mock_session_class):
+        """Test that a timeout (no response) is raised as-is."""
+        handler = MicrosoftCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.Timeout("Read timed out")
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.Timeout):
+            handler._list_events("mock_token")
 
 
 class TestNotificationChannelRefreshWithScheduler(TransactionTestCase):

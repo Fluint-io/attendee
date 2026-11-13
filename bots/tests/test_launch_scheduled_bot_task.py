@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone as django_timezone
 
 from accounts.models import Organization
@@ -71,6 +71,35 @@ class LaunchScheduledBotTaskTestCase(TestCase):
 
             # Verify launch_bot was not called
             mock_launch_bot.assert_not_called()
+
+    @override_settings(SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS=300)
+    def test_stale_bot_is_not_launched(self):
+        """Test that a task running past the launch window ends the bot instead of launching it"""
+        stale_join_at = django_timezone.now() - django_timezone.timedelta(seconds=301)
+        self.bot.join_at = stale_join_at
+        self.bot.save()
+
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot:
+            launch_scheduled_bot(self.bot.id, stale_join_at.isoformat())
+
+            self.bot.refresh_from_db()
+            self.assertEqual(self.bot.state, BotStates.FATAL_ERROR)
+            self.assertEqual(self.bot.bot_events.last().event_sub_type, BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED)
+            mock_launch_bot.assert_not_called()
+
+    @override_settings(SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS=300)
+    def test_bot_within_launch_window_is_launched(self):
+        """Test that a task running late but inside the launch window still launches the bot"""
+        late_join_at = django_timezone.now().replace(microsecond=0) - django_timezone.timedelta(seconds=240)
+        self.bot.join_at = late_join_at
+        self.bot.save()
+
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot:
+            launch_scheduled_bot(self.bot.id, late_join_at.isoformat())
+
+            self.bot.refresh_from_db()
+            self.assertEqual(self.bot.state, BotStates.STAGED)
+            mock_launch_bot.assert_called_once_with(self.bot)
 
     def test_join_at_modified_after_task_queued(self):
         """Test the race condition where join_at is modified between task queueing and execution"""

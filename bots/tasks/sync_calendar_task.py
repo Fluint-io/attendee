@@ -386,6 +386,9 @@ class GoogleCalendarSyncHandler(CalendarSyncHandler):
         expired_notification_channels.delete()
 
     def _raise_if_error_is_authentication_error(self, e: requests.RequestException):
+        # Timeout and ConnectionError carry no response
+        if e.response is None:
+            return
         error_code = e.response.json().get("error")
         if error_code == "invalid_grant" or error_code == "invalid_client" or error_code == "deleted_client":
             raise CalendarAPIAuthenticationError(f"Google Authentication error: {e.response.json()}")
@@ -428,7 +431,7 @@ class GoogleCalendarSyncHandler(CalendarSyncHandler):
 
         except requests.RequestException as e:
             self._raise_if_error_is_authentication_error(e)
-            raise CalendarAPIError(f"Failed to refresh Google access token. Response body: {e.response.json()}")
+            raise CalendarAPIError(f"Failed to refresh Google access token. Response body: {e.response.text if e.response is not None else None}")
 
     def _make_gcal_request(self, url: str, access_token: str, params: dict = None, method: str = "GET", body: dict = None) -> dict:
         headers = {"Authorization": f"Bearer {access_token}"}
@@ -444,7 +447,7 @@ class GoogleCalendarSyncHandler(CalendarSyncHandler):
             return resp.json()
         except requests.RequestException as e:
             self._raise_if_error_is_authentication_error(e)
-            logger.exception(f"Failed to make Google Calendar request. Response body: {e.response.json()}")
+            logger.exception(f"Failed to make Google Calendar request. Response body: {e.response.text if e.response is not None else None}")
             raise e
 
     def _list_events(self, access_token: str) -> List[dict]:
@@ -657,6 +660,9 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
         logger.info(f"Calendar {self.calendar.object_id}: Created Microsoft Calendar notification channel in database. Platform UUID: {calendar_notification_channel.platform_uuid}")
 
     def _raise_if_error_is_authentication_error(self, e: requests.RequestException):
+        # Timeout and ConnectionError carry no response
+        if e.response is None:
+            return
         if e.response.json().get("error") == "invalid_grant" or e.response.json().get("error") == "invalid_client":
             raise CalendarAPIAuthenticationError(f"Microsoft Authentication error: {e.response.json()}")
 
@@ -717,7 +723,7 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
 
         except requests.RequestException as e:
             self._raise_if_error_is_authentication_error(e)
-            raise CalendarAPIError(f"Failed to refresh Microsoft access token. Response body: {e.response.json()}")
+            raise CalendarAPIError(f"Failed to refresh Microsoft access token. Response body: {e.response.text if e.response is not None else None}")
 
     # ---------------------------
     # HTTP helpers
@@ -753,7 +759,7 @@ class MicrosoftCalendarSyncHandler(CalendarSyncHandler):
             return resp.json()
         except requests.RequestException as e:
             self._raise_if_error_is_authentication_error(e)
-            logger.exception(f"Failed to make Microsoft Graph request. Response body: {e.response.json()}")
+            logger.exception(f"Failed to make Microsoft Graph request. Response body: {e.response.text if e.response is not None else None}")
             raise e
 
     # ---------------------------
