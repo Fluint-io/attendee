@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone as django_timezone
 
 from accounts.models import Organization
@@ -70,6 +70,57 @@ class LaunchScheduledBotTaskTestCase(TestCase):
             self.assertEqual(self.bot.bot_events.last().event_sub_type, BotEventSubTypes.FATAL_ERROR_OUT_OF_CREDITS)
 
             # Verify launch_bot was not called
+            mock_launch_bot.assert_not_called()
+
+    @override_settings(SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS=300)
+    def test_stale_bot_is_not_launched(self):
+        """Test that a task running past the launch window ends the bot instead of launching it"""
+        stale_join_at = django_timezone.now() - django_timezone.timedelta(seconds=301)
+        self.bot.join_at = stale_join_at
+        self.bot.save()
+
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot:
+            launch_scheduled_bot(self.bot.id, stale_join_at.isoformat())
+
+            self.bot.refresh_from_db()
+            self.assertEqual(self.bot.state, BotStates.FATAL_ERROR)
+            self.assertEqual(self.bot.bot_events.last().event_sub_type, BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED)
+            mock_launch_bot.assert_not_called()
+
+    @override_settings(SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS=300)
+    def test_bot_within_launch_window_is_launched(self):
+        """Test that a task running late but inside the launch window still launches the bot"""
+        late_join_at = django_timezone.now().replace(microsecond=0) - django_timezone.timedelta(seconds=240)
+        self.bot.join_at = late_join_at
+        self.bot.save()
+
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot:
+            launch_scheduled_bot(self.bot.id, late_join_at.isoformat())
+
+            self.bot.refresh_from_db()
+            self.assertEqual(self.bot.state, BotStates.STAGED)
+            mock_launch_bot.assert_called_once_with(self.bot)
+
+    @override_settings(SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS=300)
+    def test_stale_bot_rescheduled_before_lock_is_not_ended(self):
+        """Test that a stale bot whose join_at moves forward before the locked recheck is left SCHEDULED"""
+        stale_join_at = django_timezone.now() - django_timezone.timedelta(seconds=301)
+        new_join_at = django_timezone.now() + django_timezone.timedelta(hours=1)
+        self.bot.join_at = stale_join_at
+        self.bot.save()
+
+        def mock_get_bot_and_move_join_at(id, *args, **kwargs):
+            bot = Bot.objects.filter(id=id).first()
+            Bot.objects.filter(id=id).update(join_at=new_join_at)
+            return bot
+
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot:
+            with patch("bots.models.Bot.objects.get", side_effect=mock_get_bot_and_move_join_at):
+                launch_scheduled_bot(self.bot.id, stale_join_at.isoformat())
+
+            self.bot.refresh_from_db()
+            self.assertEqual(self.bot.state, BotStates.SCHEDULED)
+            self.assertEqual(self.bot.join_at, new_join_at)
             mock_launch_bot.assert_not_called()
 
     def test_join_at_modified_after_task_queued(self):

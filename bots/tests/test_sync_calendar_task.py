@@ -3,6 +3,7 @@ from datetime import timezone as python_timezone
 from unittest.mock import Mock, patch
 
 import requests
+from concurrency.exceptions import RecordModifiedError
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -301,6 +302,24 @@ class TestSyncCalendar(TestCase):
         mock_handler.sync_events.assert_called_once()
         self.assertEqual(result, {"success": True})
 
+    @patch("bots.tasks.sync_calendar_task.GoogleCalendarSyncHandler")
+    def test_sync_calendar_first_attempt_is_not_final(self, mock_handler_class):
+        """Test sync_calendar tells the handler a first attempt is not the final one."""
+        calendar = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, client_id="test_client_id")
+
+        sync_calendar(calendar.id)
+
+        mock_handler_class.return_value.sync_events.assert_called_once_with(is_final_attempt=False)
+
+    @patch("bots.tasks.sync_calendar_task.GoogleCalendarSyncHandler")
+    def test_sync_calendar_last_retry_is_final(self, mock_handler_class):
+        """Test sync_calendar tells the handler the last retry is the final attempt."""
+        calendar = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, client_id="test_client_id")
+
+        sync_calendar.apply(args=[calendar.id], retries=sync_calendar.max_retries, throw=True)
+
+        mock_handler_class.return_value.sync_events.assert_called_once_with(is_final_attempt=True)
+
     def test_sync_calendar_unsupported_platform(self):
         """Test sync_calendar task raises error for unsupported platform."""
         calendar = Calendar.objects.create(project=self.project, platform="unsupported", client_id="test_client_id")
@@ -538,6 +557,65 @@ class TestCalendarSyncHandlerSyncEvents(TransactionTestCase):
         self.calendar.refresh_from_db()
         self.assertIsNotNone(self.calendar.last_attempted_sync_at)
 
+    @patch("bots.tasks.sync_calendar_task.trigger_webhook")
+    def test_successful_sync_keeps_request_stamped_after_load(self, mock_trigger_webhook):
+        """Test that a successful sync only writes its own fields and keeps a request stamped after the handler loaded the calendar."""
+        handler = CalendarSyncHandler(self.calendar.id)
+        requested_at = timezone.now()
+        Calendar.objects.filter(id=self.calendar.id).update(sync_task_requested_at=requested_at)
+
+        handler._get_access_token = Mock(return_value="mock_token")
+        handler._list_events = Mock(return_value=[])
+        handler._refresh_notification_channels = Mock()
+
+        result = handler.sync_events()
+
+        self.assertTrue(result["success"])
+        self.calendar.refresh_from_db()
+        self.assertEqual(self.calendar.sync_task_requested_at, requested_at)
+        self.assertIsNotNone(self.calendar.last_successful_sync_at)
+
+    @patch("bots.tasks.sync_calendar_task.trigger_webhook")
+    def test_sync_request_made_during_sync_survives(self, mock_trigger_webhook):
+        """Test that a webhook's sync request stamped mid-sync is not overwritten by the sync's own save."""
+        handler = CalendarSyncHandler(self.calendar.id)
+        requested_at = timezone.now()
+
+        def list_events_and_request_sync(*args, **kwargs):
+            # Same write as the external webhook views
+            calendar = Calendar.objects.get(id=self.calendar.id)
+            calendar.sync_task_requested_at = requested_at
+            calendar.save()
+            return []
+
+        handler._get_access_token = Mock(return_value="mock_token")
+        handler._list_events = Mock(side_effect=list_events_and_request_sync)
+        handler._refresh_notification_channels = Mock()
+
+        # The calendar's version field rejects the sync's stale save, so the attempt fails and retries
+        with self.assertRaises(RecordModifiedError):
+            handler.sync_events(is_final_attempt=False)
+
+        self.calendar.refresh_from_db()
+        self.assertEqual(self.calendar.sync_task_requested_at, requested_at)
+
+    def test_sync_events_general_exception_only_stamps_final_attempt(self):
+        """Test that a failed attempt that will be retried leaves last_attempted_sync_at unset"""
+        handler = CalendarSyncHandler(self.calendar.id)
+        handler._get_access_token = Mock(side_effect=Exception("General error"))
+
+        with self.assertRaises(Exception):
+            handler.sync_events(is_final_attempt=False)
+
+        self.calendar.refresh_from_db()
+        self.assertIsNone(self.calendar.last_attempted_sync_at)
+
+        with self.assertRaises(Exception):
+            handler.sync_events(is_final_attempt=True)
+
+        self.calendar.refresh_from_db()
+        self.assertIsNotNone(self.calendar.last_attempted_sync_at)
+
 
 class TestGoogleCalendarSyncHandler(TestCase):
     """Test the GoogleCalendarSyncHandler class."""
@@ -702,6 +780,39 @@ class TestGoogleCalendarSyncHandler(TestCase):
         result = handler._get_event_by_id("nonexistent_event", "mock_token")
 
         self.assertIsNone(result)
+
+    @patch("requests.Session")
+    def test_make_gcal_request_timeout_raises_timeout(self, mock_session_class):
+        """Test that a timeout (no response) is raised as-is."""
+        handler = GoogleCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.Timeout("Read timed out")
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.Timeout):
+            handler._list_events("mock_token")
+
+    @patch("requests.Session")
+    def test_make_gcal_request_html_error_body_raises_http_error(self, mock_session_class):
+        """Test that a non-JSON (HTML 502) error body doesn't mask the HTTPError."""
+        handler = GoogleCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
+
+        response = requests.Response()
+        response.status_code = 502
+        response._content = b"<html><body>502 Bad Gateway</body></html>"
+        response.headers["content-type"] = "text/html"
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.HTTPError("502 Server Error: Bad Gateway", response=response)
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.HTTPError):
+            handler._list_events("mock_token")
 
 
 class TestMicrosoftCalendarSyncHandler(TestCase):
@@ -873,6 +984,39 @@ class TestMicrosoftCalendarSyncHandler(TestCase):
         self.assertEqual(result[0]["id"], "event_1")
         self.assertEqual(result[2]["id"], "event_3")
         self.assertEqual(mock_session.send.call_count, 2)
+
+    @patch("requests.Session")
+    def test_make_graph_request_timeout_raises_timeout(self, mock_session_class):
+        """Test that a timeout (no response) is raised as-is."""
+        handler = MicrosoftCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.Timeout("Read timed out")
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.Timeout):
+            handler._list_events("mock_token")
+
+    @patch("requests.Session")
+    def test_make_graph_request_html_error_body_raises_http_error(self, mock_session_class):
+        """Test that a non-JSON (HTML 502) error body doesn't mask the HTTPError."""
+        handler = MicrosoftCalendarSyncHandler(self.calendar.id)
+        handler.time_window_start = timezone.now() - timedelta(days=1)
+        handler.time_window_end = timezone.now() + timedelta(days=1)
+
+        response = requests.Response()
+        response.status_code = 502
+        response._content = b"<html><body>502 Bad Gateway</body></html>"
+        response.headers["content-type"] = "text/html"
+
+        mock_session = Mock()
+        mock_session.send.side_effect = requests.HTTPError("502 Server Error: Bad Gateway", response=response)
+        mock_session_class.return_value.__enter__.return_value = mock_session
+
+        with self.assertRaises(requests.HTTPError):
+            handler._list_events("mock_token")
 
 
 class TestNotificationChannelRefreshWithScheduler(TransactionTestCase):

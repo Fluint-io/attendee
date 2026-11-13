@@ -1,6 +1,9 @@
 import logging
 
 from celery import shared_task
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
 
 from bots.launch_bot_utils import launch_bot
 from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes, BotStates
@@ -17,6 +20,19 @@ def launch_scheduled_bot(self, bot_id: int, bot_join_at: str):
 
     if bot.state != BotStates.SCHEDULED:
         logger.info(f"Bot {bot_id} ({bot.object_id}) is not in state SCHEDULED, skipping")
+        return
+
+    # The task can run long after the scheduler queued it; a late bot could record the next meeting in a reused room.
+    launch_deadline = timezone.now() - timezone.timedelta(seconds=settings.SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS)
+    if bot.join_at < launch_deadline:
+        with transaction.atomic():
+            # Lock and recheck so a duplicate task can't end a bot another task just launched, or one whose join_at was just moved.
+            bot = Bot.objects.select_for_update().get(id=bot_id)
+            if bot.state != BotStates.SCHEDULED or bot.join_at >= launch_deadline:
+                logger.info(f"Bot {bot_id} ({bot.object_id}) is no longer a stale scheduled bot, skipping")
+                return
+            logger.error(f"Bot {bot_id} ({bot.object_id}) was not launched because its join_at ({bot.join_at.isoformat()}) is past the launch window.")
+            BotEventManager.create_event(bot=bot, event_type=BotEventTypes.FATAL_ERROR, event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED)
         return
 
     if bot.project.organization.out_of_credits():
