@@ -14,7 +14,7 @@ FIRST_RUN_LOOKBACK_DAYS=7
 MAX_COMMITS=40
 MAX_OTHER_PRS=10
 MAX_SLACK_RELEASES=5
-PRIORITY_PATHS='^bots/[a-z_]*adapter|(^|/)Dockerfile|chrom'
+PRIORITY_PATHS='^bots/[a-z_]+adapter(/|\.py$)|(^|/)Dockerfile[^/]*$|chrom'
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 upstream_owner="${UPSTREAM%%/*}"
 upstream_name="${UPSTREAM##*/}"
@@ -107,7 +107,10 @@ fi
 pr_areas() {
   gh api --paginate "repos/$UPSTREAM/pulls/$1/files?per_page=100" --jq '.[].filename' |
     { grep -iE "$PRIORITY_PATHS" || true; } |
-    sed -E -e 's#^bots/([a-z_]*adapter)[/.].*#\1#' -e 's#^(.*/)?(Dockerfile[^/]*)$#\2#' -e '/adapter$|^Dockerfile/!s#.*#chrome#' |
+    # Labels are built only from safe characters; any other match is reported as "chrome".
+    awk '/^bots\/[a-z_]+adapter(\/|\.py$)/ { sub(/^bots\//, ""); sub(/[\/.].*/, ""); print; next }
+      /(^|\/)Dockerfile[A-Za-z0-9._-]*$/ { sub(/.*\//, ""); print; next }
+      { print "chrome" }' |
     sort -u | paste -sd, -
 }
 clean() { local t=${1//'##['/'# #['}; printf '%s\n' "$t"; }
