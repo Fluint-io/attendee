@@ -17,6 +17,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from bots.bot_log_context import join_error_limiter
 from bots.bot_sso_utils import get_google_meet_set_cookie_url
 from bots.google_meet_bot_adapter.okta_authenticator import OktaAuthenticator, OktaSessionError
 from bots.models import RecordingViews
@@ -161,9 +162,9 @@ class GoogleMeetUIMethods:
                 if self.number_of_times_blocked_by_google > 1:
                     logger.warning("Google is blocking us for whatever reason and we have the ability to login but we aren't using it, so we should raise a UiLoginRequiredException. Logging in will get us unblocked.")
                     raise UiLoginRequiredException("Login required to get around blocking", step)
-                logger.warning(f"Google is blocking us for whatever reason and we have the ability to login. So far it has only happened {self.number_of_times_blocked_by_google} times, so we will simply retry.")
+                join_error_limiter.log(logger, logging.WARNING, ("google_blocking", "login_available"), "Google is blocking us for whatever reason and we have the ability to login, so we will simply retry once.")
 
-            logger.warning(f"Google is blocking us for whatever reason, but we can retry. Element text: '{element_text}'. Raising UiGoogleBlockingUsException")
+            join_error_limiter.log(logger, logging.WARNING, ("google_blocking", element_text), "Google is blocking us for whatever reason, but we can retry. Element text: '%s'. Raising UiGoogleBlockingUsException", element_text)
             raise UiGoogleBlockingUsException("You can't join this video call", step)
 
     def look_for_login_required_element(self, step):
