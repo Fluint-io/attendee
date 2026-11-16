@@ -6,7 +6,7 @@ from django.utils import timezone as django_timezone
 
 from accounts.models import Organization
 from bots.models import Bot, BotEventSubTypes, BotEventTypes, BotStates, Project
-from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
+from bots.tasks.launch_scheduled_bot_task import count_stale_launch_skip, launch_scheduled_bot
 
 
 class LaunchScheduledBotTaskTestCase(TestCase):
@@ -79,13 +79,19 @@ class LaunchScheduledBotTaskTestCase(TestCase):
         self.bot.join_at = stale_join_at
         self.bot.save()
 
-        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot:
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as mock_launch_bot, patch("bots.tasks.launch_scheduled_bot_task.count_stale_launch_skip") as mock_count:
             launch_scheduled_bot(self.bot.id, stale_join_at.isoformat())
 
             self.bot.refresh_from_db()
             self.assertEqual(self.bot.state, BotStates.FATAL_ERROR)
             self.assertEqual(self.bot.bot_events.last().event_sub_type, BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED)
             mock_launch_bot.assert_not_called()
+            mock_count.assert_called_once_with()
+
+    def test_stale_launch_skip_count_survives_a_counter_failure(self):
+        """Test that a broken counter never fails the launch task"""
+        with patch("bots.tasks.launch_scheduled_bot_task._stale_launch_skip_counter", side_effect=RuntimeError("boom")):
+            count_stale_launch_skip()
 
     @override_settings(SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS=300)
     def test_bot_within_launch_window_is_launched(self):
