@@ -45,7 +45,7 @@ releases=$(gh api "repos/$UPSTREAM/releases?per_page=30" \
   --jq '.[] | select(.draft or .prerelease | not) | [.tag_name, .html_url, .published_at] | @tsv')
 missing=()
 while IFS=$'\t' read -r tag url published; do
-  [ -z "$tag" ] && continue
+  [[ "$tag" =~ ^[A-Za-z0-9._+-]+$ ]] || continue
   ahead=$(compare "$tag" | jq '.ahead_by')
   [ "$ahead" -eq 0 ] && continue
   missing+=("$tag"$'\t'"$url"$'\t'"$published"$'\t'"$ahead")
@@ -78,7 +78,12 @@ else
     echo "\`$BASE\` is **$behind commits behind $latest**. [Compare]($compare_base:$latest)"
     echo
     echo "$releases_md"
-    echo "#### Commits (newest first, up to $MAX_COMMITS)"
+    # The compare API returns only the oldest 250 commits.
+    if [ "$behind" -gt 250 ]; then
+      echo "#### Commits (from the oldest 250 of $behind; see Compare for the rest)"
+    else
+      echo "#### Commits (newest first, up to $MAX_COMMITS)"
+    fi
     commit_lines "$MAX_COMMITS" md
     echo
   } >>"$SUMMARY"
