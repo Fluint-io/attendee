@@ -18,6 +18,7 @@ from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.bot_adapter import BotAdapter
 from bots.bot_controller.bot_websocket_client_manager import BotWebsocketClientManager
 from bots.bot_controller.main_thread_executor import MainThreadExecutor
+from bots.bot_log_context import join_error_limiter, log_bot_start, provider_for_bot
 from bots.bot_sso_utils import create_google_meet_sign_in_session
 from bots.bots_api_utils import BotCreationSource
 from bots.external_callback_utils import get_zoom_tokens
@@ -677,6 +678,7 @@ class BotController:
             logger.info("Cleanup already called, exiting")
             return
         self.cleanup_called = True
+        join_error_limiter.flush()
 
         normal_quitting_process_worked = False
         import threading
@@ -904,6 +906,11 @@ class BotController:
         if self.run_called:
             raise Exception("Run already called, exiting")
         self.run_called = True
+
+        try:
+            log_bot_start(self.bot_in_db, provider_for_bot(self.bot_in_db))
+        except Exception:
+            logger.exception("Could not write the bot.start log record")
 
         self.connect_to_redis()
 
@@ -2022,6 +2029,8 @@ class BotController:
                     event_sub_type=BotEventSubTypes.FATAL_ERROR_UI_ELEMENT_NOT_FOUND,
                     event_metadata={
                         "bot_restarts_exceeded_max_retries": True,
+                        "exception_type": message.get("exception_type"),
+                        "step": message.get("step"),
                     },
                 )
                 self.cleanup()
@@ -2038,12 +2047,17 @@ class BotController:
                     event_sub_type=BotEventSubTypes.FATAL_ERROR_UI_ELEMENT_NOT_FOUND,
                     event_metadata={
                         "blocked_by_platform_while_in_waiting_room": True,
+                        "exception_type": message.get("exception_type"),
+                        "step": message.get("step"),
                     },
                 )
                 self.cleanup()
                 return
 
-            logger.info("Received message that we were blocked by platform repeatedly, so recreating pod")
+            logger.info(
+                "Received message that we were blocked by platform repeatedly, so recreating pod",
+                extra={"event_name": "bot.restart", "exception_type": message.get("exception_type") or "", "step": message.get("step") or ""},
+            )
             # Run task to restart the bot pod with 1 minute delay
             restart_bot_pod.apply_async(args=[self.bot_in_db.id], countdown=60)
             # Don't do the normal cleanup tasks because we'll be restarting the pod

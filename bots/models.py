@@ -2163,6 +2163,21 @@ class BotEventManager:
                         },
                     )
 
+                    if transitioned_to_post_meeting_state:
+                        from bots.bot_log_context import log_bot_outcome
+
+                        try:
+                            log_bot_outcome(
+                                bot,
+                                event_type=BotEventTypes.type_to_api_code(event_type),
+                                event_sub_type=BotEventSubTypes.sub_type_to_api_code(event_sub_type),
+                                old_state=BotStates.state_to_api_code(old_state),
+                                new_state=BotStates.state_to_api_code(bot.state),
+                                event_metadata=event_metadata,
+                            )
+                        except Exception:
+                            logger.exception("Could not write the bot.outcome log record")
+
                     # If we are configured to log bot state changes, log it
                     if settings.LOG_BOT_STATE_CHANGES:
                         logger.info(

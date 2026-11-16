@@ -24,6 +24,7 @@ from websockets.sync.server import serve
 from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.automatic_leave_utils import participant_is_another_bot
 from bots.bot_adapter import BotAdapter
+from bots.bot_log_context import join_error_limiter
 from bots.models import ParticipantEventTypes, RecordingViews
 from bots.per_participant_realtime_video_configuration import PerParticipantRealtimeVideoConfiguration
 from bots.room_sync_source_participant_configuration import RoomSyncSourceParticipantConfiguration
@@ -999,8 +1000,24 @@ class WebBotAdapter(BotAdapter):
 
         while num_retries <= max_retries:
             try:
-                self.init_driver()
-                self.attempt_to_join_meeting()
+                try:
+                    self.init_driver()
+                    self.attempt_to_join_meeting()
+                except Exception as e:
+                    step = getattr(e, "step", None) or "unknown"
+                    join_error_limiter.log(
+                        logger,
+                        logging.WARNING,
+                        (e.__class__.__name__, step),
+                        "bot.join_error exception=%s step=%s",
+                        e.__class__.__name__,
+                        step,
+                        event_name="bot.join_error",
+                        exception_type=e.__class__.__name__,
+                        step=step,
+                    )
+                    raise
+                join_error_limiter.flush()
                 logger.info("Successfully joined meeting")
                 break
 
@@ -1056,7 +1073,7 @@ class WebBotAdapter(BotAdapter):
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is infinitely retryable but the bot has left the meeting or cleaned up, so returning")
                     return
 
-                logger.warning(f"Failed to join meeting and the {e.__class__.__name__} exception is infinitely retryable so retrying")
+                join_error_limiter.log(logger, logging.WARNING, ("retry", e.__class__.__name__), f"Failed to join meeting and the {e.__class__.__name__} exception is infinitely retryable so retrying")
 
             except UiRetryableExpectedException as e:
                 if num_retries >= max_retries:
@@ -1070,10 +1087,11 @@ class WebBotAdapter(BotAdapter):
                     num_retries += 1
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and {num_expected_exceptions} expected exceptions have occurred, so incrementing num_retries. This usually indicates that the meeting has not started yet, so we will wait for the configured amount of time which is 180 seconds before retrying")
                     # We're going to start a new pod to see if that fixes the issue
-                    self.send_message_callback({"message": self.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY})
+                    join_error_limiter.flush()
+                    self.send_message_callback({"message": self.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY, "exception_type": e.__class__.__name__, "step": e.step})
                     return
                 else:
-                    logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected so not incrementing num_retries, but {num_expected_exceptions} expected exceptions have occurred")
+                    join_error_limiter.log(logger, logging.INFO, ("retry", e.__class__.__name__), f"Failed to join meeting and the {e.__class__.__name__} exception is expected so not incrementing num_retries")
 
             except UiRetryableException as e:
                 if num_retries >= max_retries:
