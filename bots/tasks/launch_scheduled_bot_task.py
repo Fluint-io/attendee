@@ -1,3 +1,4 @@
+import functools
 import logging
 
 from celery import shared_task
@@ -9,6 +10,28 @@ from bots.launch_bot_utils import launch_bot
 from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes, BotStates
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _stale_launch_skip_counter():
+    # The OTEL API is not a base dependency; a deployment that installs it and sets a meter provider gets the counter.
+    try:
+        from opentelemetry import metrics
+    except ImportError:
+        return None
+    return metrics.get_meter("attendee").create_counter(
+        name="attendee.bot.launch.stale_skipped",
+        description="Scheduled bot launches skipped because join_at was past the launch window.",
+    )
+
+
+def count_stale_launch_skip():
+    try:
+        counter = _stale_launch_skip_counter()
+        if counter is not None:
+            counter.add(1)
+    except Exception:
+        logger.exception("Failed to count a stale launch skip")
 
 
 @shared_task(bind=True, soft_time_limit=3600)
@@ -33,6 +56,7 @@ def launch_scheduled_bot(self, bot_id: int, bot_join_at: str):
                 return
             logger.error(f"Bot {bot_id} ({bot.object_id}) was not launched because its join_at ({bot.join_at.isoformat()}) is past the launch window.")
             BotEventManager.create_event(bot=bot, event_type=BotEventTypes.FATAL_ERROR, event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED)
+        count_stale_launch_skip()
         return
 
     if bot.project.organization.out_of_credits():
