@@ -1,9 +1,14 @@
 name: Upstream check
+run-name: Upstream check${{ inputs.since && ' (backfill)' || '' }}
 
 on:
   schedule:
     - cron: '0 14 * * *'
   workflow_dispatch:
+    inputs:
+      since:
+        description: 'Backfill: report from this UTC time (e.g. 2026-11-09T00:00:00Z). No Slack; does not move the baseline.'
+        required: false
 
 permissions:
   contents: read
@@ -24,4 +29,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SINCE_OVERRIDE: ${{ inputs.since }}
         run: .github/scripts/check-upstream.sh
