@@ -40,14 +40,14 @@ echo "Reporting items created after $since and up to $until_ts."
 
 slack=""
 
-# Releases the fork lacks. Upstream releases are linear on main, so stop at the first one the fork has.
+# Releases the fork lacks, checked one by one since a hotfix release need not contain earlier ones.
 releases=$(gh api "repos/$UPSTREAM/releases?per_page=30" \
   --jq '.[] | select(.draft or .prerelease | not) | [.tag_name, .html_url, .published_at] | @tsv')
 missing=()
 while IFS=$'\t' read -r tag url published; do
   [ -z "$tag" ] && continue
   ahead=$(compare "$tag" | jq '.ahead_by')
-  [ "$ahead" -eq 0 ] && break
+  [ "$ahead" -eq 0 ] && continue
   missing+=("$tag"$'\t'"$url"$'\t'"$published"$'\t'"$ahead")
 done <<<"$releases"
 
