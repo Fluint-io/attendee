@@ -9,6 +9,9 @@ on:
       since:
         description: 'Backfill: report from this UTC time (e.g. 2026-11-09T00:00:00Z). No Slack; does not move the baseline.'
         required: false
+      sync_ref:
+        description: 'Upstream ref for the Codex sync PR: main (default), a tag, or pull/<n>/head for an open upstream PR.'
+        required: false
 
 permissions:
   contents: read
@@ -31,3 +34,48 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SINCE_OVERRIDE: ${{ inputs.since }}
         run: .github/scripts/check-upstream.sh
+
+  # Merges upstream into a branch, lets Codex decide if it is worth a PR and resolve conflicts, then
+  # opens the PR. A person reviews and merges; deploys stay manual. Backfill runs skip it.
+  sync:
+    if: ${{ !inputs.since }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the meeting service (read-only, for the import check)
+        uses: actions/checkout@v4
+        with:
+          repository: Fluint-io/meeting
+          path: .sync-overlay/meeting
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          persist-credentials: false
+      - name: Start the upstream merge
+        id: prep
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          SYNC_REF: ${{ inputs.sync_ref }}
+        run: .github/scripts/upstream-sync.sh prepare
+      - name: Codex reviews the merge
+        if: steps.prep.outputs.run == 'true'
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1.14
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ runner.temp }}/upstream-sync-prompt.md
+          output-schema-file: .github/codex/upstream-sync-schema.json
+          output-file: ${{ runner.temp }}/upstream-sync-decision.json
+          sandbox: workspace-write
+          model: ${{ vars.UPSTREAM_SYNC_MODEL }}
+      - name: Open the sync PR
+        if: steps.prep.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: .github/scripts/upstream-sync.sh finish

@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sync", "reason", "summary", "risks", "overlay_check"],
+  "properties": {
+    "sync": { "type": "boolean" },
+    "reason": { "type": "string" },
+    "summary": { "type": "string" },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "overlay_check": { "type": "string" }
+  }
+}
