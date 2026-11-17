@@ -35,10 +35,29 @@ jobs:
           SINCE_OVERRIDE: ${{ inputs.since }}
         run: .github/scripts/check-upstream.sh
 
-  # Merges upstream into a branch and lets Codex decide if it is worth a PR and resolve conflicts.
-  # This job holds no write token: Codex can change any file here, including this script.
-  sync:
+  # Copies the meeting service code for Codex's import check, so the token stays out of the sync job.
+  overlay:
     if: ${{ !inputs.since }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Fluint-io/meeting
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          sparse-checkout: service
+          persist-credentials: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meeting-service
+          path: service/
+          retention-days: 1
+
+  # Merges upstream into a branch and lets Codex decide if it is worth a PR and resolve conflicts.
+  # This job holds no GitHub secret: Codex can change any file here, including this script.
+  sync:
+    needs: overlay
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -52,13 +71,10 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: Check out the meeting service (read-only, for the import check)
-        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          repository: Fluint-io/meeting
-          path: .sync-overlay/meeting
-          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
-          persist-credentials: false
+          name: meeting-service
+          path: .sync-overlay/meeting/service
       - name: Start the upstream merge
         id: prep
         env:

@@ -3,8 +3,8 @@
 #   prepare: (sync job) starts `git merge --no-commit` and writes the Codex prompt. Output run=true|false.
 #   package: (sync job, no secrets) commits Codex's result as a git bundle. Output publish=true|false.
 #   publish: (publish job) checks the bundle and opens the PR with SYNC_TOKEN.
-# Codex can edit any file in the sync job's checkout, so only publish holds a write token, and it runs
-# from a fresh checkout of main and treats the bundle and Codex's decision as data.
+# Codex can edit any file in the sync job's checkout, so that job holds no GitHub secret. Only publish
+# holds a write token; it runs from a fresh checkout of main and treats the bundle and notes as data.
 set -euo pipefail
 
 UPSTREAM="${UPSTREAM:-attendee-labs/attendee}"
@@ -32,12 +32,16 @@ label_for() {
   esac
 }
 minor_bump() { jq -r .version | awk -F. '{ printf "%d.%d.0", $1, $2 + 1 }'; }
+# The PR branch runs its own workflows with repository secrets before anyone reviews it, so .github
+# always stays as on main. Upstream .github changes are listed in the PR for a person to port.
+keep_base_github() { git restore --source=HEAD --staged --worktree -- .github; }
 
 prepare() {
   mkdir -p "$OUT"
   local open
-  open=$(gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 1000 --json headRefName \
-    --jq "[.[] | select(.headRefName | startswith(\"$BRANCH_PREFIX\"))][0].headRefName // \"\"")
+  open=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+    --jq ".[].head.ref | select(startswith(\"$BRANCH_PREFIX\"))")
+  open=${open%%$'\n'*}
   if [ -n "$open" ]; then
     echo "Upstream sync PR from $open is still open; not opening another." | tee -a "$SUMMARY"
     echo "run=false" >>"$GITHUB_OUTPUT"
@@ -59,6 +63,8 @@ prepare() {
   git rev-parse -q --verify MERGE_HEAD >/dev/null || fail "git merge did not start"
   # version.json stays on the fork's own line; package bumps it.
   git checkout HEAD -- version.json
+  git diff --name-only "HEAD...$target" -- .github >"$OUT/dropped-github.txt"
+  keep_base_github
   git diff --name-only --diff-filter=U >"$OUT/conflicts.txt"
 
   {
@@ -91,6 +97,7 @@ package() {
 
   # Only tracked files: anything new that Codex wrote is left out.
   git add -u
+  keep_base_github
   local unmerged
   unmerged=$(git diff --name-only --diff-filter=U)
   [ -z "$unmerged" ] || fail "Conflicts remain after Codex: $(paste -sd' ' - <<<"$unmerged")"
@@ -104,9 +111,6 @@ package() {
   git bundle create -q "$OUT/sync.bundle" "$RESULT_REF" "^HEAD^1"
   echo "publish=true" >>"$GITHUB_OUTPUT"
 }
-
-# git rev-parse of path at commit, or "none" when the path does not exist there.
-blob() { git rev-parse -q --verify "$1:$2" 2>/dev/null || echo none; }
 
 publish() {
   : "${SYNC_TOKEN:?UPSTREAM_SYNC_TOKEN secret is not set}"
@@ -122,19 +126,10 @@ publish() {
   target=$(fetch_upstream)
   git merge-base --is-ancestor "$p2" "$target" || fail "The merged commit $p2 is not in upstream $REF"
 
-  # A workflow change runs in CI with repository secrets before review, so .github files must match
-  # main or upstream exactly; Codex may not write its own.
-  local f
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    case "$(blob "$result" "$f")" in
-      "$(blob "$base" "$f")" | "$(blob "$p2" "$f")") ;;
-      *) fail "$f differs from both $BASE and upstream" ;;
-    esac
-  done < <(git diff --name-only "$base" "$result" -- .github)
+  git diff --quiet "$base" "$result" -- .github || fail "The sync result changes .github"
 
   local changed=() hits rc=0
-  mapfile -t changed < <(git diff --name-only --diff-filter=d "$base" "$result")
+  mapfile -d '' -t changed < <(git diff -z --name-only --diff-filter=d "$base" "$result")
   if [ ${#changed[@]} -gt 0 ]; then
     hits=$(git grep -lE "$MARKERS" "$result" -- "${changed[@]}") || rc=$?
     [ "$rc" -eq 1 ] || fail "Conflict markers remain, or the scan failed (exit $rc): ${hits:-}"
@@ -148,7 +143,7 @@ publish() {
   local label behind branch title decision="$OUT/decision.json" body="$TMP/upstream-sync-body.md"
   label=$(label_for "$p2")
   behind=$(git rev-list --count "$base..$p2")
-  branch="$BRANCH_PREFIX${p2:0:7}-${GITHUB_RUN_ID:?}"
+  branch="$BRANCH_PREFIX${p2:0:7}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:-1}"
   title="feat: sync fork with upstream attendee $label"
   git push -q "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$result:refs/heads/$branch"
 
@@ -168,6 +163,15 @@ publish() {
     if grep -qE '^[A-Za-z0-9._/@+-]+$' "$OUT/conflicts.txt" 2>/dev/null; then
       # shellcheck disable=SC2016 # literal backticks
       grep -E '^[A-Za-z0-9._/@+-]+$' "$OUT/conflicts.txt" | sed 's/^/- `/; s/$/`/'
+    else
+      echo "None."
+    fi
+    echo
+    echo "### Upstream \`.github\` changes left out"
+    echo "The sync never changes \`.github\`, because this branch runs its workflows before review. Port these by hand if they matter:"
+    if grep -qE '^[A-Za-z0-9._/@+-]+$' "$OUT/dropped-github.txt" 2>/dev/null; then
+      # shellcheck disable=SC2016 # literal backticks
+      grep -E '^[A-Za-z0-9._/@+-]+$' "$OUT/dropped-github.txt" | sed 's/^/- `/; s/$/`/'
     else
       echo "None."
     fi
