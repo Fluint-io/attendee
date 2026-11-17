@@ -11,7 +11,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from bots.models import RecordingViews
 from bots.utils import cyrillicize_keywords_in_string, remove_characters_from_string, truncate_string_with_ellipsis
-from bots.web_bot_adapter.ui_methods import UiBlockedByCaptchaException, UiCouldNotClickElementException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiCouldNotLocateElementException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
+from bots.web_bot_adapter.ui_methods import RequestToJoinDeniedReason, UiBlockedByCaptchaException, UiCouldNotClickElementException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiCouldNotLocateElementException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class TeamsUIMethods:
         if waiting_element:
             # Check if we've been waiting too long
             logger.info("Still waiting to be admitted to the meeting after waiting period expired. Raising UiRequestToJoinDeniedException")
-            raise UiRequestToJoinDeniedException("Bot was not let in after waiting period expired", step)
+            raise UiRequestToJoinDeniedException("Bot was not let in after waiting period expired", step, reason=RequestToJoinDeniedReason.NOT_ADMITTED_IN_TIME)
 
     def check_if_in_waiting_room(self):
         if self.sent_bot_put_in_waiting_room_message:
@@ -427,7 +427,7 @@ class TeamsUIMethods:
             if dismiss_button:
                 logger.info("Clicking the dismiss button...")
                 self.click_element(dismiss_button, "dismiss_button")
-            raise UiRequestToJoinDeniedException("Someone in the call denied your request to join", step)
+            raise UiRequestToJoinDeniedException("Someone in the call denied your request to join", step, reason=RequestToJoinDeniedReason.DENIED_BY_HOST)
 
     def set_layout(self, layout_to_select):
         logger.info("Waiting for the view button...")

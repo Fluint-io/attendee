@@ -1926,6 +1926,12 @@ class BotController:
 
         return {"remover_name": participant.full_name, "remover_uuid": participant.uuid, "remover_user_uuid": participant.user_uuid, "remover_is_host": participant.is_host}
 
+    def get_request_to_join_denied_metadata(self, message):
+        metadata = self.get_remover_metadata(message) or {}
+        if message.get("denial_reason"):
+            metadata["denial_reason"] = message["denial_reason"]
+        return metadata or None
+
     def take_action_based_on_message_from_adapter(self, message):
         if message.get("message") == BotAdapter.Messages.SAVE_SCREENSHOT_AND_MHTML_FILE:
             logger.info("Received message to save screenshot and mhtml file")
@@ -1948,7 +1954,7 @@ class BotController:
                 bot=self.bot_in_db,
                 event_type=BotEventTypes.COULD_NOT_JOIN,
                 event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_REQUEST_TO_JOIN_DENIED,
-                event_metadata=self.get_remover_metadata(message),
+                event_metadata=self.get_request_to_join_denied_metadata(message),
             )
             self.cleanup()
             return
