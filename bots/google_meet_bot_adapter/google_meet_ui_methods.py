@@ -22,7 +22,7 @@ from bots.bot_sso_utils import get_google_meet_set_cookie_url
 from bots.google_meet_bot_adapter.okta_authenticator import OktaAuthenticator, OktaSessionError
 from bots.models import RecordingViews
 from bots.utils import mask_url_query_param_values
-from bots.web_bot_adapter.ui_methods import UiCouldNotClickElementException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiCouldNotLocateElementException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableExpectedException
+from bots.web_bot_adapter.ui_methods import RequestToJoinDeniedReason, UiCouldNotClickElementException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiCouldNotLocateElementException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableExpectedException
 
 from .mocap_manager import MocapManager
 
@@ -192,13 +192,13 @@ class GoogleMeetUIMethods:
 
         if any(text in element_text for text in actively_denied_texts):
             logger.warning("Someone in the call actively denied our request to join. Raising UiRequestToJoinDeniedException")
-            raise UiRequestToJoinDeniedException("Someone in the call denied your request to join", step)
+            raise UiRequestToJoinDeniedException("Someone in the call denied your request to join", step, reason=RequestToJoinDeniedReason.DENIED_BY_HOST)
         elif any(text in element_text for text in no_one_responded_texts):
             logger.warning("No one responded to our request to join (timeout). Raising UiRequestToJoinDeniedException")
-            raise UiRequestToJoinDeniedException("No one responded to your request to join the call", step)
+            raise UiRequestToJoinDeniedException("No one responded to your request to join the call", step, reason=RequestToJoinDeniedReason.NO_RESPONSE)
         else:  # "You left the meeting"
             logger.warning("Saw 'You left the meeting' element. Happens if someone actively denied our request to join. Raising UiRequestToJoinDeniedException")
-            raise UiRequestToJoinDeniedException("You left the meeting", step)
+            raise UiRequestToJoinDeniedException("You left the meeting", step, reason=RequestToJoinDeniedReason.LEFT_MEETING)
 
     def look_for_asking_to_be_let_in_element_after_waiting_period_expired(self, step):
         asking_to_be_let_in_element = self.find_element_by_selector(
@@ -207,7 +207,7 @@ class GoogleMeetUIMethods:
         )
         if asking_to_be_let_in_element:
             logger.warning("Bot was not let in after waiting period expired. Raising UiRequestToJoinDeniedException")
-            raise UiRequestToJoinDeniedException("Bot was not let in after waiting period expired", step)
+            raise UiRequestToJoinDeniedException("Bot was not let in after waiting period expired", step, reason=RequestToJoinDeniedReason.NOT_ADMITTED_IN_TIME)
 
     def check_if_in_waiting_room(self, step):
         if self.sent_bot_put_in_waiting_room_message:

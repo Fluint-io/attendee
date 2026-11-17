@@ -5,9 +5,20 @@ class UiException(Exception):
         super().__init__(message)
 
 
+class RequestToJoinDeniedReason:
+    """Why a request to join ended. Only DENIED_BY_HOST is a person saying no; the rest are lobby timeouts or an unclear page."""
+
+    DENIED_BY_HOST = "denied_by_host"
+    NO_RESPONSE = "no_response"
+    NOT_ADMITTED_IN_TIME = "not_admitted_in_time"
+    LEFT_MEETING = "left_meeting"
+    UNKNOWN = "unknown"
+
+
 # When this exception is raised, the bot will stop running and log that it was denied access to the meeting
 class UiRequestToJoinDeniedException(UiException):
-    def __init__(self, message, step=None, inner_exception=None):
+    def __init__(self, message, step=None, inner_exception=None, reason=RequestToJoinDeniedReason.UNKNOWN):
+        self.reason = reason
         super().__init__(message, step, inner_exception)
 
 

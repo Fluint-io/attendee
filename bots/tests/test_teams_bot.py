@@ -2633,6 +2633,16 @@ class TestTeamsBot(TransactionTestCase):
         self.assertIsNone(controller.get_remover_metadata({}))
         self.assertIsNone(controller.get_remover_metadata({"remover": None}))
 
+    def test_request_to_join_denied_metadata_carries_the_denial_reason(self):
+        controller = BotController(self.bot.id)
+
+        self.assertEqual(controller.get_request_to_join_denied_metadata({"denial_reason": "no_response"}), {"denial_reason": "no_response"})
+        self.assertIsNone(controller.get_request_to_join_denied_metadata({}))
+
+        metadata = controller.get_request_to_join_denied_metadata({"denial_reason": "denied_by_host", "remover": {"uuid": "8:orgid:00000000-0000-0000-0000-000000000004", "name": "Test User"}})
+        self.assertEqual(metadata["denial_reason"], "denied_by_host")
+        self.assertEqual(metadata["remover_name"], "Test User")
+
     def test_remover_metadata_ignores_a_participant_of_another_bot(self):
         """Participants are looked up per bot, so another bot's participant is not reported as a record we have."""
         other_bot = Bot.objects.create(

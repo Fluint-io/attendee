@@ -578,8 +578,8 @@ class WebBotAdapter(BotAdapter):
         logger.info("Sending BOT_PUT_IN_WAITING_ROOM message")
         self.send_message_callback({"message": self.Messages.BOT_PUT_IN_WAITING_ROOM})
 
-    def send_request_to_join_denied_message(self):
-        self.send_message_callback({"message": self.Messages.REQUEST_TO_JOIN_DENIED, "remover": self.remover})
+    def send_request_to_join_denied_message(self, reason):
+        self.send_message_callback({"message": self.Messages.REQUEST_TO_JOIN_DENIED, "remover": self.remover, "denial_reason": reason})
 
     def send_meeting_not_found_message(self):
         self.send_message_callback({"message": self.Messages.MEETING_NOT_FOUND})
@@ -1030,8 +1030,8 @@ class WebBotAdapter(BotAdapter):
                 self.send_login_attempt_failed_message()
                 return
 
-            except UiRequestToJoinDeniedException:
-                self.send_request_to_join_denied_message()
+            except UiRequestToJoinDeniedException as e:
+                self.send_request_to_join_denied_message(e.reason)
                 return
 
             except UiCouldNotJoinMeetingWaitingRoomTimeoutException:
