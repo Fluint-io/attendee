@@ -131,7 +131,7 @@ publish() {
   local changed=() hits rc=0
   mapfile -d '' -t changed < <(git diff -z --name-only --diff-filter=d "$base" "$result")
   if [ ${#changed[@]} -gt 0 ]; then
-    hits=$(git grep -lE "$MARKERS" "$result" -- "${changed[@]}") || rc=$?
+    hits=$(git --literal-pathspecs grep -lE "$MARKERS" "$result" -- "${changed[@]}") || rc=$?
     [ "$rc" -eq 1 ] || fail "Conflict markers remain, or the scan failed (exit $rc): ${hits:-}"
   fi
 
