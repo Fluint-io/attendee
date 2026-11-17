@@ -35,8 +35,8 @@ jobs:
           SINCE_OVERRIDE: ${{ inputs.since }}
         run: .github/scripts/check-upstream.sh
 
-  # Merges upstream into a branch, lets Codex decide if it is worth a PR and resolve conflicts, then
-  # opens the PR. A person reviews and merges; deploys stay manual. Backfill runs skip it.
+  # Merges upstream into a branch and lets Codex decide if it is worth a PR and resolve conflicts.
+  # This job holds no write token: Codex can change any file here, including this script.
   sync:
     if: ${{ !inputs.since }}
     runs-on: ubuntu-latest
@@ -44,9 +44,12 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      publish: ${{ steps.package.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           persist-credentials: false
       - name: Check out the meeting service (read-only, for the import check)
@@ -60,7 +63,6 @@ jobs:
         id: prep
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
           SYNC_REF: ${{ inputs.sync_ref }}
         run: .github/scripts/upstream-sync.sh prepare
       - name: Codex reviews the merge
@@ -70,11 +72,42 @@ jobs:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: ${{ runner.temp }}/upstream-sync-prompt.md
           output-schema-file: .github/codex/upstream-sync-schema.json
-          output-file: ${{ runner.temp }}/upstream-sync-decision.json
+          output-file: ${{ runner.temp }}/upstream-sync/decision.json
           sandbox: workspace-write
-      - name: Open the sync PR
+      - name: Commit the result as a bundle
+        id: package
         if: steps.prep.outputs.run == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_REF: ${{ inputs.sync_ref }}
+        run: .github/scripts/upstream-sync.sh package
+      - if: steps.package.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/upstream-sync/
+          retention-days: 7
+
+  # Runs the script from a fresh checkout of main, checks the bundle, then pushes and opens the PR.
+  # A person reviews and merges; deploys stay manual.
+  publish:
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/upstream-sync
+      - name: Open the sync PR
+        env:
           SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
-        run: .github/scripts/upstream-sync.sh finish
+          SYNC_REF: ${{ inputs.sync_ref }}
+        run: .github/scripts/upstream-sync.sh publish
