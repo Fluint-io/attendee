@@ -72,7 +72,6 @@ jobs:
           output-schema-file: .github/codex/upstream-sync-schema.json
           output-file: ${{ runner.temp }}/upstream-sync-decision.json
           sandbox: workspace-write
-          model: ${{ vars.UPSTREAM_SYNC_MODEL }}
       - name: Open the sync PR
         if: steps.prep.outputs.run == 'true'
         env:
