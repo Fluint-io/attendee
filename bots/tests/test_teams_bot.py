@@ -460,6 +460,86 @@ class TestTeamsBot(TransactionTestCase):
                 "No FATAL_ERROR event should be created when the pod is restarted",
             )
 
+    @override_settings(PREJOIN_LEAVE_OR_MEETING_END_IS_FATAL_ERROR=True)
+    @patch("bots.tasks.restart_bot_pod_task.BotPodCreator")
+    @patch("bots.tasks.restart_bot_pod_task.find_bot_pod_name", return_value="bot-pod")
+    @patch("bots.tasks.restart_bot_pod_task.client.CoreV1Api")
+    @patch("bots.tasks.restart_bot_pod_task.config.load_incluster_config")
+    @patch("bots.web_bot_adapter.web_bot_adapter.Display")
+    @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
+    @patch("bots.bot_controller.bot_controller.S3FileUploader")
+    def test_restart_bot_pod_when_leave_requested_while_pod_was_down(
+        self,
+        MockFileUploader,
+        MockChromeDriver,
+        MockDisplay,
+        mock_load_incluster_config,
+        MockCoreV1Api,
+        mock_find_bot_pod_name,
+        MockBotPodCreator,
+    ):
+        """Test that a leave requested while a joining bot's pod was down still ends the bot.
+
+        Flow:
+        1. The bot is JOINING and its pod has gone away, so restart_bot_pod has been scheduled.
+        2. Before the task runs, the user asks the bot to leave, moving it to LEAVING. No pod receives the sync command.
+        3. restart_bot_pod still recreates the pod.
+        4. The restarted bot controller starts in LEAVING, leaves without having joined, and ends the bot
+           with a COULD_NOT_JOIN / leave requested before bot joined event.
+        """
+        from kubernetes import client as k8s_client
+
+        from bots.tasks.restart_bot_pod_task import restart_bot_pod
+
+        MockCoreV1Api.return_value.read_namespaced_pod.side_effect = k8s_client.ApiException(status=404)
+        MockBotPodCreator.return_value.create_bot_pod.return_value = {"created": True}
+
+        BotEventManager.create_event(self.bot, BotEventTypes.LEAVE_REQUESTED, event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_USER_REQUESTED)
+        self.bot.refresh_from_db()
+        self.assertEqual(self.bot.state, BotStates.LEAVING)
+
+        restart_bot_pod(self.bot.id)
+
+        MockBotPodCreator.return_value.create_bot_pod.assert_called_once()
+
+        MockFileUploader.return_value = create_mock_file_uploader()
+        MockChromeDriver.return_value = create_mock_teams_driver()
+        MockDisplay.return_value = MagicMock()
+
+        controller = BotController(self.bot.id)
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+        bot_thread.join(timeout=15)
+        self.assertFalse(bot_thread.is_alive(), "Restarted bot controller should finish after leaving")
+
+        connection.close()
+
+        self.bot.refresh_from_db()
+        self.assertEqual(self.bot.state, BotStates.FATAL_ERROR)
+        could_not_join_event = self.bot.bot_events.order_by("created_at").last()
+        self.assertEqual(could_not_join_event.event_type, BotEventTypes.COULD_NOT_JOIN)
+        self.assertEqual(could_not_join_event.event_sub_type, BotEventSubTypes.COULD_NOT_JOIN_MEETING_LEAVE_REQUESTED_BEFORE_BOT_JOINED)
+        self.assertEqual(could_not_join_event.metadata["state_when_leave_requested"], BotStates.state_to_api_code(BotStates.JOINING))
+
+        leave_requested_event = self.bot.bot_events.get(event_type=BotEventTypes.LEAVE_REQUESTED)
+        self.assertEqual(len(leave_requested_event.metadata["pod_recreations"]), 1)
+
+    @patch("bots.tasks.restart_bot_pod_task.BotPodCreator")
+    @patch("bots.tasks.restart_bot_pod_task.client.CoreV1Api")
+    def test_restart_bot_pod_skipped_when_leave_requested_after_bot_joined(self, MockCoreV1Api, MockBotPodCreator):
+        """Test that restart_bot_pod does not recreate the pod of a bot that joined the meeting and was then asked to leave,
+        since that bot's own pod is handling the leave."""
+        from bots.tasks.restart_bot_pod_task import restart_bot_pod
+
+        BotEventManager.create_event(self.bot, BotEventTypes.BOT_JOINED_MEETING)
+        BotEventManager.create_event(self.bot, BotEventTypes.LEAVE_REQUESTED, event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_USER_REQUESTED)
+
+        restart_bot_pod(self.bot.id)
+
+        MockCoreV1Api.assert_not_called()
+        MockBotPodCreator.return_value.create_bot_pod.assert_not_called()
+
     @patch("bots.web_bot_adapter.web_bot_adapter.Display")
     @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
     @patch("bots.bot_controller.bot_controller.S3FileUploader")
@@ -2883,3 +2963,199 @@ class TestTeamsBot(TransactionTestCase):
         bot_thread.join(timeout=5)
 
         connection.close()
+
+    @patch("bots.web_bot_adapter.web_bot_adapter.connect")
+    @patch("bots.web_bot_adapter.web_bot_adapter.Display")
+    @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
+    @patch("bots.bot_controller.bot_controller.S3FileUploader")
+    @patch("bots.tasks.deliver_webhook_task.deliver_webhook")
+    def test_meeting_id_change_after_being_admitted_from_lobby_keeps_participants_in_sync(
+        self,
+        mock_deliver_webhook,
+        MockFileUploader,
+        MockChromeDriver,
+        MockDisplay,
+        MockBiDiConnect,
+    ):
+        """
+        Teams can give the call a new id partway through, for example when an anonymous bot is
+        admitted from the lobby. The bot's own participant record arrives first with the lobby
+        call id, which becomes the meeting id, and everything after carries the new call id.
+        Before the payload reported the change, every later participant update was rejected
+        as a meeting id mismatch, so no joins or leaves were recorded and the bot never noticed
+        it was alone in the meeting.
+
+        The messages are sent over the adapter's websocket server, the way the chromedriver payload
+        sends them, so the whole path from a websocket message to the saved records runs.
+
+        Flow:
+        1. The bot joins and its own record arrives with the lobby call id, which becomes the meeting id.
+        2. A change whose previous id is not the current meeting id is ignored.
+        3. The payload reports the change from the lobby call id to the meeting call id.
+        4. Participants arriving with the new call id are accepted and their join is saved.
+        5. A participant leaving with the new call id is saved, and the bot sees it is alone.
+        """
+        mock_deliver_webhook.return_value = None
+
+        # Configure the mock uploader
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the Chrome driver
+        mock_driver = create_mock_teams_driver()
+        mock_driver.capabilities = {"webSocketUrl": "ws://localhost:9222/session/test-session"}
+        MockChromeDriver.return_value = mock_driver
+
+        # Mock virtual display
+        mock_display = MagicMock()
+        MockDisplay.return_value = mock_display
+
+        # Stub the BiDi websocket the domain allow list listener connects to, so it
+        # sees a successful session.subscribe response and then an empty message stream
+        mock_bidi_socket = MagicMock()
+        mock_bidi_socket.recv.return_value = json.dumps({"id": 1, "type": "success", "result": {}})
+        MockBiDiConnect.return_value = mock_bidi_socket
+
+        lobby_call_id = "d3a0d419-0fad-4ea9-ad3f-33bf0b6f0c6b"
+        meeting_call_id = "1b8e5a22-bdfc-42ad-b45c-02620b4a322a"
+        bot_uuid = "8:teamsvisitor:f0bde8c7ab9b458388aa0439e759cc25"
+        attendee_uuid = "8:orgid:00000000-0000-0000-0000-000000000009"
+
+        def user_record(device_id, full_name, is_current_user, meeting_id):
+            return {
+                "deviceId": device_id,
+                "displayName": full_name,
+                "fullName": full_name,
+                "status": "active",
+                "humanized_status": "in_meeting",
+                "isCurrentUser": is_current_user,
+                "isHost": False,
+                "meetingId": meeting_id,
+            }
+
+        # Create bot controller
+        controller = BotController(self.bot.id)
+
+        # Mock the attempt_to_join_meeting to succeed immediately
+        with patch("bots.teams_bot_adapter.teams_ui_methods.TeamsUIMethods.attempt_to_join_meeting") as mock_attempt_to_join:
+            mock_attempt_to_join.return_value = None  # Successful join
+
+            # Run the bot in a separate thread since it has an event loop
+            bot_thread = threading.Thread(target=controller.run)
+            bot_thread.daemon = True
+            bot_thread.start()
+
+            # Wait for the bot to join, start recording and start its websocket server
+            time.sleep(3)
+            self.assertIsNotNone(controller.adapter.websocket_port, "The adapter should have started its websocket server by now")
+
+            # Update events are not saved in the database, so record what the adapter emits
+            emitted_participant_events = []
+            emit_participant_event = controller.adapter.add_participant_event_callback
+
+            def record_participant_event(event):
+                emitted_participant_events.append(event)
+                return emit_participant_event(event)
+
+            controller.adapter.add_participant_event_callback = record_participant_event
+
+            def emitted_event_types_for(participant_uuid):
+                return [event["event_type"] for event in emitted_participant_events if event["participant_uuid"] == participant_uuid]
+
+            with ws_connect(f"ws://localhost:{controller.adapter.websocket_port}") as websocket:
+                # While the bot is in the lobby, its own record arrives with the lobby call id
+                send_json_websocket_message(
+                    websocket,
+                    {
+                        "type": "UsersUpdate",
+                        "newUsers": [user_record(bot_uuid, "Test Teams Bot", True, lobby_call_id)],
+                        "removedUsers": [],
+                        "updatedUsers": [],
+                    },
+                )
+
+                time.sleep(1)
+
+                self.assertEqual(controller.adapter.meeting_uuid, lobby_call_id, "The first participant record should set the meeting id")
+
+                # A change that does not start from the current meeting id is stale, so it is ignored
+                send_json_websocket_message(
+                    websocket,
+                    {
+                        "type": "MeetingIdChange",
+                        "previousMeetingId": "some-other-call-id",
+                        "newMeetingId": "yet-another-call-id",
+                    },
+                )
+
+                time.sleep(1)
+
+                self.assertEqual(controller.adapter.meeting_uuid, lobby_call_id, "A change from a meeting id the adapter does not have should be ignored")
+
+                # The bot is admitted and the call id changes. The payload reports the change before
+                # it sends any participants with the new call id
+                send_json_websocket_message(
+                    websocket,
+                    {
+                        "type": "MeetingIdChange",
+                        "previousMeetingId": lobby_call_id,
+                        "newMeetingId": meeting_call_id,
+                    },
+                )
+                send_json_websocket_message(
+                    websocket,
+                    {
+                        "type": "UsersUpdate",
+                        "newUsers": [user_record(attendee_uuid, "Gabe White", False, meeting_call_id)],
+                        "removedUsers": [],
+                        "updatedUsers": [user_record(bot_uuid, "Test Teams Bot", True, meeting_call_id)],
+                    },
+                )
+
+                time.sleep(1)
+
+                self.assertEqual(controller.adapter.meeting_uuid, meeting_call_id, "The meeting id should follow the call id change")
+
+                # The participant who arrived with the new call id was accepted and their join was saved
+                attendee_participant = Participant.objects.get(bot=self.bot, uuid=attendee_uuid)
+                self.assertEqual(attendee_participant.full_name, "Gabe White")
+                self.assertTrue(ParticipantEvent.objects.filter(participant=attendee_participant, event_type=ParticipantEventTypes.JOIN).exists(), "A participant with the new call id should not be rejected as a meeting id mismatch")
+                self.assertTrue(controller.adapter.participants_info[attendee_uuid]["active"])
+                self.assertIsNone(controller.adapter.only_one_participant_in_meeting_at, "The bot is not alone while another participant is in the meeting")
+
+                # The bot's own record moving to the new call id is not another join, or a leave
+                self.assertEqual(emitted_event_types_for(bot_uuid), [ParticipantEventTypes.JOIN], "The bot's record changing call id should not emit any participant events beyond its original join")
+
+                # The participant leaves, still with the new call id
+                send_json_websocket_message(
+                    websocket,
+                    {
+                        "type": "UsersUpdate",
+                        "newUsers": [],
+                        "removedUsers": [user_record(attendee_uuid, "Gabe White", False, meeting_call_id)],
+                        "updatedUsers": [],
+                    },
+                )
+
+                time.sleep(1)
+
+            # The leave was accepted, so it is saved and the bot knows it is alone in the meeting
+            self.assertEqual(emitted_event_types_for(attendee_uuid), [ParticipantEventTypes.JOIN, ParticipantEventTypes.LEAVE])
+            self.assertTrue(ParticipantEvent.objects.filter(participant=attendee_participant, event_type=ParticipantEventTypes.LEAVE).exists(), "A leave with the new call id should not be rejected as a meeting id mismatch")
+            self.assertFalse(controller.adapter.participants_info[attendee_uuid]["active"])
+            self.assertIsNotNone(controller.adapter.only_one_participant_in_meeting_at, "The bot should notice it is the only participant left, so it can auto-leave")
+
+            # Clean up: simulate meeting ending to trigger cleanup
+            controller.adapter.left_meeting = True
+            controller.adapter.send_message_callback({"message": controller.adapter.Messages.MEETING_ENDED})
+            time.sleep(2)
+
+            # Now wait for the thread to finish naturally
+            bot_thread.join(timeout=5)
+
+            # If thread is still running after timeout, that's a problem to report
+            if bot_thread.is_alive():
+                print("WARNING: Bot thread did not terminate properly after cleanup")
+
+            # Close the database connection since we're in a thread
+            connection.close()

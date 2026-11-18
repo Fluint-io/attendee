@@ -3721,6 +3721,7 @@ class CallManager {
         this.activeCall = null;
         this.closedCaptionLanguageInterval = null;
         this.closedCaptionLanguage = null;
+        this.lobbyParticipantSpeakingTicker = 0;
     }
 
     setActiveCall() {
@@ -3981,8 +3982,22 @@ class CallManager {
         const speakingParticipantIds = new Set();
 
         this.activeCall.participants.forEach(participant => {
-            if (contributingSources.some(contributingSource => participant.hasAudioSource(contributingSource.source)) && participant.id)
+            if (contributingSources.some(contributingSource => participant.hasAudioSource(contributingSource.source)) && participant.id) {
+                // Participants in the lobby can't actually be heard, so don't consider them as speaking
+                if (participant.state === ParticipantsPoller.lobbyParticipantState) {
+                    if (this.lobbyParticipantSpeakingTicker % 300 === 0) {
+                        window.ws?.sendJson({
+                            type: 'LobbyParticipantDetectedAsSpeakingWarning',
+                            participantId: participant.id,
+                            participantState: participant.state,
+                            count: this.lobbyParticipantSpeakingTicker
+                        });
+                    }
+                    this.lobbyParticipantSpeakingTicker++;
+                    return;
+                }
                 speakingParticipantIds.add(participant.id);
+            }
         });
 
         return speakingParticipantIds;
@@ -4093,6 +4108,7 @@ class ParticipantsPoller {
         this.lastLogAllParticipantsRawTime = 0;
         this.lastPollParticipantsTime = 0;
         this.fastPollUntilTime = 0;
+        this.previousCallId = null;
     }
 
     start() {
@@ -4127,7 +4143,32 @@ class ParticipantsPoller {
         this.fastPollUntilTime = Date.now() + ParticipantsPoller.fastPollWindowMs;
     }
 
+    // The callId can change in the middle of a meeting. When it does, tell the python side so it can update its meeting_uuid.
+    // This must run before the participants are synced, so that the python side doesn't reject them as a meeting id mismatch.
+    // Restricted to bots that are not signed in, until we are confident this is safe for signed in bots.
+    detectCallIdChange() {
+        if (window.teamsInitialData?.botIsSignedIn) {
+            return;
+        }
+
+        const currentCallId = window.callManager.getCallId();
+        if (!currentCallId) {
+            return;
+        }
+
+        if (this.previousCallId && this.previousCallId !== currentCallId) {
+            window.ws?.sendJson({
+                type: 'MeetingIdChange',
+                previousMeetingId: this.previousCallId,
+                newMeetingId: currentCallId
+            });
+        }
+        this.previousCallId = currentCallId;
+    }
+
     pollParticipants() {
+        this.detectCallIdChange();
+
         let participantsRaw = window.callManager.getRemoteParticipants();
         
         const localParticipantRaw = window.callManager.getLocalParticipant();
