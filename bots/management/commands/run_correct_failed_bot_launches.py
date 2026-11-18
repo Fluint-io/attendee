@@ -9,6 +9,7 @@ from django.db import connection, models
 from django.utils import timezone
 from kubernetes import client, config
 
+from bots.k8s_utils import find_bot_pod
 from bots.launch_bot_utils import launch_bot
 from bots.models import Bot, BotEventTypes, BotStates
 
@@ -91,12 +92,15 @@ class Command(BaseCommand):
             active = bool(self.ecs_task_creator.find_bot_task_arns(bot.id))
             logger.info(f"Bot {bot.object_id} ECS task active: {active}")
             return active
-        return self.bot_pod_is_active(bot.k8s_pod_name())
+        return self.bot_pod_is_active(bot)
 
-    def bot_pod_is_active(self, pod_name: str) -> bool:
+    def bot_pod_is_active(self, bot) -> bool:
         try:
-            logger.info(f"Checking if pod {pod_name} is active...")
-            pod = self.v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+            logger.info(f"Checking if bot {bot.object_id} has an active pod...")
+            pod = find_bot_pod(self.v1, self.namespace, bot)
+            if pod is None:
+                return False
+            pod_name = pod.metadata.name
             # Log all the info about the pod
             logger.info(f"Pod {pod_name} phase: {pod.status.phase}")
             # Return that it is active if pod is not in succeeded or failed phase

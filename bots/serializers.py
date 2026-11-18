@@ -258,6 +258,10 @@ BOT_IMAGE_SCHEMA = {
 TRANSCRIPTION_SETTINGS_SCHEMA = {
     "type": "object",
     "properties": {
+        "enabled": {
+            "type": "boolean",
+            "description": "Set to false to disable transcription. Defaults to true.",
+        },
         "deepgram": {
             "type": "object",
             "properties": {
@@ -484,15 +488,26 @@ TRANSCRIPTION_SETTINGS_SCHEMA = {
         "elevenlabs": {
             "type": "object",
             "properties": {
-                "model_id": {"type": "string", "description": "The ElevenLabs model to use for transcription", "enum": ["scribe_v1", "scribe_v1_experimental"]},
+                "model_id": {"type": "string", "description": "The ElevenLabs model to use for transcription", "enum": ["scribe_v1", "scribe_v1_experimental", "scribe_v2"]},
                 "language_code": {
                     "type": "string",
                     "description": "An ISO-639-1 or ISO-639-3 language_code corresponding to the language of the audio file.",
                     "enum": get_elevenlabs_language_codes(),
                 },
-                "tag_audio_events": {"type": "boolean", "description": "Whether to tag audio events like 'laughter' in the transcription."},
+                "tag_audio_events": {"type": "boolean", "description": "Whether to tag audio events like 'laughter' in the transcription. Audio events are not included in the transcript's words."},
+                "keyterms": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 49, "pattern": "^\\s*[^<>{}\\[\\]\\\\\\s]+(\\s+[^<>{}\\[\\]\\\\\\s]+){0,4}\\s*$"},
+                    "maxItems": 1000,
+                    "description": "A list of keyterms to bias the transcription towards. At most 1000 keyterms, each less than 50 characters and at most 5 words, without the characters < > { } [ ] \\. Supported by Scribe v2 models. ElevenLabs charges extra for keyterms. See here for details: https://elevenlabs.io/docs/eleven-api/guides/how-to/speech-to-text/batch/keyterm-prompting",
+                },
+                "diarize": {"type": "boolean", "description": "Whether to annotate which speaker is currently talking in the uploaded file. Only needed if multiple people are speaking into a single microphone."},
+                "num_speakers": {"type": "integer", "minimum": 1, "maximum": 32, "description": "The maximum amount of speakers talking in the uploaded file. Can help with predicting who speaks when. Defaults to the maximum the model supports."},
+                "diarization_threshold": {"type": "number", "minimum": 0.1, "maximum": 0.4, "description": "Diarization threshold to apply during speaker diarization. A higher value predicts fewer speakers. Can only be set when diarize is true and num_speakers is not set. Defaults to a model-based threshold (usually 0.22)."},
+                "use_eu_server": {"type": "boolean", "description": "Whether to use ElevenLabs' EU data residency server (api.eu.residency.elevenlabs.io). This is an ElevenLabs Enterprise feature and needs an API key from the EU workspace. Defaults to false."},
             },
             "required": ["model_id"],
+            "dependentSchemas": {"diarization_threshold": {"properties": {"diarize": {"const": True}}, "required": ["diarize"], "not": {"required": ["num_speakers"]}}},
             "additionalProperties": False,
         },
         "kyutai": {
@@ -940,6 +955,16 @@ class ZoomSettingsJSONField(serializers.JSONField):
                 "description": "Number of seconds to wait before activating the silence timeout",
                 "default": 1200,
             },
+            "silence_activate_after_participant_count": {
+                "type": "integer",
+                "description": "Activate the silence timeout once this many participants (excluding bots) are in the meeting at the same time. Silence detection activates when either this or silence_activate_after_seconds is met, whichever comes first. Disabled by default.",
+                "default": None,
+            },
+            "silence_pending_log_after_seconds": {
+                "type": "integer",
+                "description": "Number of seconds of continuous silence after which the bot creates an auto_leave_silence_pending log entry (delivered by the bot_logs.update webhook), ahead of leaving at silence_timeout_seconds. Must be less than silence_timeout_seconds. Disabled by default.",
+                "default": None,
+            },
             "only_participant_in_meeting_timeout_seconds": {
                 "type": "integer",
                 "description": "Number of seconds to wait before leaving if bot becomes the only participant in the meeting because everyone else left.",
@@ -1243,7 +1268,7 @@ ROOM_SYNC_SETTINGS_SCHEMA = {
                 },
                 "source_participant": {
                     "type": "object",
-                    "description": "Identifies the LiveKit participant whose audio and video the bot should stream into the meeting. If omitted, no media will be streamed into the meeting. Exactly one of 'identity' or 'publish_on_behalf' must be provided.",
+                    "description": "Identifies the LiveKit participant whose audio and video the bot should stream into the meeting. If omitted, no media will be streamed into the meeting. At least one of 'identity' or 'publish_on_behalf' must be provided. When both are provided, tracks matched by 'publish_on_behalf' are preferred, and tracks matched by 'identity' are streamed whenever no 'publish_on_behalf' track is available.",
                     "properties": {
                         "identity": {
                             "type": "string",
@@ -1251,10 +1276,10 @@ ROOM_SYNC_SETTINGS_SCHEMA = {
                         },
                         "publish_on_behalf": {
                             "type": "string",
-                            "description": "The bot streams tracks from the first participant whose 'lk.publish_on_behalf' attribute equals this value, which is how a LiveKit agent publishes on behalf of another participant.",
+                            "description": "The bot streams tracks from participants whose 'lk.publish_on_behalf' attribute equals this value, which is how a LiveKit agent or avatar publishes on behalf of another participant.",
                         },
                     },
-                    "oneOf": [
+                    "anyOf": [
                         {"required": ["identity"]},
                         {"required": ["publish_on_behalf"]},
                     ],
@@ -1307,6 +1332,9 @@ class CreateAsyncTranscriptionSerializer(serializers.Serializer):
             jsonschema.validate(instance=value, schema=TRANSCRIPTION_SETTINGS_SCHEMA)
         except jsonschema.exceptions.ValidationError as e:
             raise serializers.ValidationError(e.message)
+
+        if "enabled" in value:
+            raise serializers.ValidationError({"transcription_settings": "The enabled field is not applicable to an async transcription request."})
 
         if "meeting_closed_captions" in value:
             raise serializers.ValidationError({"transcription_settings": "Meeting closed captions are not available for async transcription."})
@@ -1546,6 +1574,8 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
             elif meeting_type == MeetingTypes.GOOGLE_MEET:
                 value = {"meeting_closed_captions": {}}
             elif meeting_type == MeetingTypes.TEAMS:
+                value = {"meeting_closed_captions": {}}
+            elif meeting_type == MeetingTypes.WEBEX:
                 value = {"meeting_closed_captions": {}}
             else:
                 return None
@@ -1812,6 +1842,9 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
             # Set default if not provided
             if param not in value:
                 value[param] = default
+
+        if value["silence_pending_log_after_seconds"] is not None and value["silence_pending_log_after_seconds"] >= value["silence_timeout_seconds"]:
+            raise serializers.ValidationError("silence_pending_log_after_seconds must be less than silence_timeout_seconds")
 
         return value
 
