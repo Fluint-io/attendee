@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Dict, Optional
 
 import requests
@@ -18,6 +19,12 @@ class CallbackError(Exception):
 
 class CallbackTimeoutError(CallbackError):
     """Exception raised when a callback times out"""
+
+    pass
+
+
+class CallbackNetworkError(CallbackError):
+    """Exception raised when a callback fails at the transport level"""
 
     pass
 
@@ -113,7 +120,34 @@ def make_callback_request(url: str, bot, callback_type: str, additional_data: Op
         if isinstance(e, requests.Timeout):
             raise CallbackTimeoutError(error_msg)
         else:
-            raise CallbackError(error_msg)
+            raise CallbackNetworkError(error_msg)
+
+
+# Retry budget for the zoom_tokens callback (~4 minutes); the bot fetches tokens a few minutes before join_at.
+ZOOM_TOKENS_CALLBACK_MAX_ATTEMPTS = 10
+ZOOM_TOKENS_CALLBACK_INITIAL_BACKOFF_SECONDS = 2
+ZOOM_TOKENS_CALLBACK_MAX_BACKOFF_SECONDS = 30
+
+
+def _is_retryable_callback_error(e: Exception) -> bool:
+    if isinstance(e, (CallbackTimeoutError, CallbackNetworkError)):
+        return True
+    if isinstance(e, CallbackHTTPError):
+        return e.status_code is not None and (e.status_code == 429 or 500 <= e.status_code < 600)
+    return False
+
+
+def _make_zoom_tokens_callback_with_retry(url: str, bot) -> Dict:
+    backoff = ZOOM_TOKENS_CALLBACK_INITIAL_BACKOFF_SECONDS
+    for attempt in range(1, ZOOM_TOKENS_CALLBACK_MAX_ATTEMPTS + 1):
+        try:
+            return make_callback_request(url=url, bot=bot, callback_type="zoom_tokens")
+        except Exception as e:
+            if attempt == ZOOM_TOKENS_CALLBACK_MAX_ATTEMPTS or not _is_retryable_callback_error(e):
+                raise
+            logger.warning(f"zoom_tokens callback for bot {bot.object_id} failed (attempt {attempt}/{ZOOM_TOKENS_CALLBACK_MAX_ATTEMPTS}): {e}. Retrying in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, ZOOM_TOKENS_CALLBACK_MAX_BACKOFF_SECONDS)
 
 
 def get_zoom_tokens(bot) -> Dict[str, str]:
@@ -148,8 +182,9 @@ def get_zoom_tokens(bot) -> Dict[str, str]:
 
     # Make the callback request
     try:
-        response_data = make_callback_request(url=zoom_tokens_url, bot=bot, callback_type="zoom_tokens")
-    except Exception:
+        response_data = _make_zoom_tokens_callback_with_retry(zoom_tokens_url, bot)
+    except Exception as e:
+        logger.error(f"zoom_tokens callback for bot {bot.object_id} failed, joining without tokens: {e}")
         return tokens
 
     # Verify response_data is a dict
