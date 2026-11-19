@@ -123,7 +123,8 @@ def make_callback_request(url: str, bot, callback_type: str, additional_data: Op
             raise CallbackNetworkError(error_msg)
 
 
-# Retry budget for the zoom_tokens callback (~4 minutes); the bot fetches tokens a few minutes before join_at.
+# Worst case ~8 min (10 x 30s timeouts + ~3 min of sleeps), which can push the join past join_at.
+# A late join is preferred over a token-less join, which Zoom refuses.
 ZOOM_TOKENS_CALLBACK_MAX_ATTEMPTS = 10
 ZOOM_TOKENS_CALLBACK_INITIAL_BACKOFF_SECONDS = 2
 ZOOM_TOKENS_CALLBACK_MAX_BACKOFF_SECONDS = 30
