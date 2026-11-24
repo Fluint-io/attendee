@@ -10,11 +10,18 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
-from .models import CalendarNotificationChannel, ZoomOAuthApp, ZoomOAuthConnection
+from .models import Calendar, CalendarNotificationChannel, ZoomOAuthApp, ZoomOAuthConnection
 from .stripe_utils import process_checkout_session_completed, process_customer_updated, process_payment_intent_succeeded
 from .zoom_oauth_connections_utils import _upsert_zoom_meeting_to_zoom_oauth_connection_mapping, _verify_zoom_webhook_signature, compute_zoom_webhook_validation_response
 
 logger = logging.getLogger(__name__)
+
+
+def _request_calendar_sync(calendar):
+    # A queryset update skips the version check. Calendar.save() raised RecordModifiedError
+    # (a 500) whenever a sync task saved the same calendar during the request.
+    now = timezone.now()
+    Calendar.objects.filter(pk=calendar.pk).update(sync_task_requested_at=now, updated_at=now)
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -63,8 +70,7 @@ class ExternalWebhookMicrosoftCalendarView(View):
                 calendar_notification_channel.save()
 
                 # Request a sync task for the calendar. Don't request immediately to provide debouncing.
-                calendar_notification_channel.calendar.sync_task_requested_at = timezone.now()
-                calendar_notification_channel.calendar.save()
+                _request_calendar_sync(calendar_notification_channel.calendar)
 
                 logger.info(f"Requested sync task for calendar {calendar_notification_channel.calendar.object_id}")
 
@@ -104,8 +110,7 @@ class ExternalWebhookGoogleCalendarView(View):
         calendar_notification_channel.save()
 
         # Request a sync task for the calendar. Don't request immediately to provide debouncing.
-        calendar_notification_channel.calendar.sync_task_requested_at = timezone.now()
-        calendar_notification_channel.calendar.save()
+        _request_calendar_sync(calendar_notification_channel.calendar)
 
         logger.info(f"Requested sync task for calendar {calendar_notification_channel.calendar.object_id}")
 

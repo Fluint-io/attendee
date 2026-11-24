@@ -55,6 +55,26 @@ class TestGoogleCalendarWebhooks(TestCase):
         self.calendar.refresh_from_db()
         self.assertIsNotNone(self.calendar.sync_task_requested_at)
 
+    def test_google_webhook_does_not_conflict_with_concurrent_sync_save(self):
+        """A sync task that loaded the calendar before the webhook can still save it, and the request survives."""
+        sync_task_copy = Calendar.objects.get(pk=self.calendar.pk)
+
+        response = self.client.post(
+            self.url,
+            data="",
+            content_type="application/json",
+            HTTP_X_GOOG_CHANNEL_ID="test_channel_123",
+            HTTP_X_GOOG_RESOURCE_STATE="exists",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        sync_task_copy.last_attempted_sync_at = timezone.now()
+        sync_task_copy.save(update_fields=["last_attempted_sync_at", "updated_at", "version"])
+
+        self.calendar.refresh_from_db()
+        self.assertIsNotNone(self.calendar.sync_task_requested_at)
+        self.assertIsNotNone(self.calendar.last_attempted_sync_at)
+
     def test_google_webhook_sync_resource_state_ignored(self):
         """Test that Google webhook with resource state 'sync' is ignored."""
         response = self.client.post(
